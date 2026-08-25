@@ -245,6 +245,58 @@ def tool_output_looks_truncated(text: str) -> bool:
     return any(marker in lowered for marker in TRUNCATED_OUTPUT_MARKERS)
 
 
+def parse_explore_source_fields(
+    item: dict,
+) -> tuple[str, int, int, str | None] | None:
+    """Return unclamped (path, start, end, focus) from an explore_source_code call."""
+    if not is_explore_source_code_call(item):
+        return None
+    args = _parse_call_arguments(item)
+    if not args:
+        return None
+    path = args.get(EXPLORE_PATH_KEY)
+    if not isinstance(path, str) or not path.strip():
+        return None
+    start = _parse_explore_line(args.get(EXPLORE_START_KEY))
+    end = _parse_explore_line(args.get(EXPLORE_END_KEY))
+    if start is None or end is None:
+        return None
+    focus: str | None = None
+    raw_focus = args.get(FOCUS_ARG_KEY)
+    if isinstance(raw_focus, str) and raw_focus.strip():
+        focus = raw_focus.strip()
+    return path.strip(), start, end, focus
+
+
+def restore_explore_function_call(
+    item: dict,
+    *,
+    path: str,
+    focus_question: str | None,
+    start_line: int,
+    end_line: int,
+) -> dict:
+    """Rewrite a client-facing exec_command item back to explore_source_code."""
+    payload = {
+        EXPLORE_PATH_KEY: path,
+        FOCUS_ARG_KEY: focus_question or "",
+        EXPLORE_START_KEY: start_line,
+        EXPLORE_END_KEY: end_line,
+    }
+    raw = item.get("arguments")
+    arguments: dict | str
+    if isinstance(raw, dict):
+        arguments = payload
+    else:
+        arguments = json.dumps(payload, ensure_ascii=False)
+    return {
+        **item,
+        "type": FUNCTION_CALL_TYPE,
+        "name": EXPLORE_TOOL_NAME,
+        "arguments": arguments,
+    }
+
+
 def rewrite_explore_call_to_exec(
     item: dict,
     max_chars: int = 300,

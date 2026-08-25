@@ -9,6 +9,7 @@ from typing import Any
 from headroom.proxy.explore_pruner.ast_protect import strip_shell_line_numbers
 from headroom.proxy.explore_pruner.focus import (
     EXPLORE_TOOL_INSTRUCTIONS,
+    FUNCTION_CALL_TYPE,
     FUNCTION_OUTPUT_TYPE,
     PRUNED_CALL_IDS_KEY,
     aggregate_output_text,
@@ -16,6 +17,8 @@ from headroom.proxy.explore_pruner.focus import (
     has_python_file_scope,
     is_explore_source_code_call,
     normalize_responses_input,
+    parse_explore_source_fields,
+    restore_explore_function_call,
     rewrite_explore_call_to_exec,
     rewrite_pruned_output,
     shell_commands,
@@ -120,6 +123,10 @@ class ExploreToolService:
                 focus,
             )
             if call_id:
+                fields = parse_explore_source_fields(item)
+                path, start, end = (None, None, None)
+                if fields is not None:
+                    path, start, end, _orig_focus = fields
                 self._store.upsert(
                     session_key,
                     str(call_id),
@@ -127,6 +134,9 @@ class ExploreToolService:
                         commands=cmds,
                         focus_question=focus,
                         created_at=time.time(),
+                        explore_path=path,
+                        explore_start_line=start,
+                        explore_end_line=end,
                     ),
                 )
             new_items.append(rewritten)
@@ -138,7 +148,11 @@ class ExploreToolService:
         *,
         session_key: str,
     ) -> bool:
-        """Prune function_call_output items using the configured reducer.
+        """Prune function_call_output items and restore explore calls for upstream.
+
+        Client transcripts store rewritten ``exec_command`` items. This rewrites
+        those back to ``explore_source_code`` (using the outbound store) so the
+        model sees a consistent tool name, then prunes matching outputs.
 
         Returns True when the body input was modified.
         """
@@ -147,6 +161,16 @@ class ExploreToolService:
             return False
 
         changed = False
+        working: list[Any] = []
+        for item in items:
+            restored = self._restore_explore_call_item(item, session_key)
+            if restored is not item:
+                changed = True
+                working.append(restored)
+            else:
+                working.append(item)
+        items = working
+
         pruned_ids: set[str] = set()
         existing = body.get(PRUNED_CALL_IDS_KEY)
         if isinstance(existing, (set, list, tuple, frozenset)):
@@ -259,9 +283,43 @@ class ExploreToolService:
 
         if changed:
             body["input"] = new_items
-            # Use a list so later json.dumps(body) in compression stays valid.
-            body[PRUNED_CALL_IDS_KEY] = sorted(pruned_ids)
+            if pruned_ids:
+                # Use a list so later json.dumps(body) in compression stays valid.
+                body[PRUNED_CALL_IDS_KEY] = sorted(pruned_ids)
         return changed
+
+    def _restore_explore_call_item(self, item: Any, session_key: str) -> Any:
+        """Map client exec_command history back to explore_source_code for upstream."""
+        if not isinstance(item, dict) or item.get("type") != FUNCTION_CALL_TYPE:
+            return item
+        if is_explore_source_code_call(item):
+            return item
+        if str(item.get("name") or "") != "exec_command":
+            return item
+        call_id = item.get("call_id")
+        if not call_id:
+            return item
+        record = self._store.get(session_key, str(call_id))
+        if (
+            record is None
+            or not record.explore_path
+            or record.explore_start_line is None
+            or record.explore_end_line is None
+            or not record.focus_question
+        ):
+            return item
+        logger.debug(
+            "explore_pruner inbound restore call_id=%s path=%r",
+            call_id,
+            record.explore_path,
+        )
+        return restore_explore_function_call(
+            item,
+            path=record.explore_path,
+            focus_question=record.focus_question,
+            start_line=record.explore_start_line,
+            end_line=record.explore_end_line,
+        )
 
     def _focus_from_input_items(
         self, items: list[Any], call_id: str

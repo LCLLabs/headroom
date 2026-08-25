@@ -132,6 +132,9 @@ def test_explore_to_sed_rewrite_and_store():
     assert rec is not None
     assert rec.focus_question == "How does auth work?"
     assert rec.commands
+    assert rec.explore_path == "/tmp/app.py"
+    assert rec.explore_start_line == 1
+    assert rec.explore_end_line == 900
 
 
 def test_missing_line_args_no_rewrite():
@@ -330,6 +333,80 @@ async def test_cached_pruned_output_skips_reducer():
     assert body2["input"][0]["output"] == "ONCE"
 
 
+@pytest.mark.asyncio
+async def test_inbound_restores_explore_tool_name_for_upstream():
+    """Client history stores exec_command; upstream must see explore_source_code."""
+    reducer = FakeTextReducer("PRUNED")
+    svc = ExploreToolService(reducer=reducer, min_chars_to_prune=10)
+    rewritten = svc.rewrite_outbound_items([_explore_call()], session_key="s")
+    assert rewritten[0]["name"] == "exec_command"
+    body = {
+        "input": [
+            rewritten[0],
+            _output("c1", _long_py(80)),
+        ]
+    }
+    changed = await svc.prune_inbound(body, session_key="s")
+    assert changed is True
+    call = body["input"][0]
+    assert call["name"] == EXPLORE_TOOL_NAME
+    assert call["call_id"] == "c1"
+    args = json.loads(call["arguments"])
+    assert args["path"] == "/tmp/app.py"
+    assert args["focus_question"] == "How does auth work?"
+    assert args["start_line"] == 1
+    assert args["end_line"] == 50
+    assert "cmd" not in args
+    assert body["input"][1]["output"] == "PRUNED"
+
+
+@pytest.mark.asyncio
+async def test_inbound_does_not_restore_native_sed():
+    svc = ExploreToolService(reducer=FakeTextReducer(), min_chars_to_prune=10)
+    native = {
+        "type": "function_call",
+        "name": "exec_command",
+        "call_id": "native-sed",
+        "arguments": json.dumps({"cmd": "sed -n '1,80p' /tmp/app.py"}),
+    }
+    body = {"input": [native, _output("native-sed", _long_py(80))]}
+    await svc.prune_inbound(body, session_key="s")
+    assert body["input"][0]["name"] == "exec_command"
+    assert json.loads(body["input"][0]["arguments"])["cmd"].startswith("sed -n")
+
+
+@pytest.mark.asyncio
+async def test_later_turn_restores_explore_name_from_cache():
+    reducer = FakeTextReducer("ONCE")
+    svc = ExploreToolService(reducer=reducer, min_chars_to_prune=10)
+    rewritten = svc.rewrite_outbound_items([_explore_call()], session_key="s")
+    await svc.prune_inbound(
+        {"input": [rewritten[0], _output("c1", _long_py(80))]},
+        session_key="s",
+    )
+    replay = {
+        "input": [
+            dict(rewritten[0]),
+            _output("c1", _long_py(80)),
+        ]
+    }
+    await svc.prune_inbound(replay, session_key="s")
+    assert reducer.calls == 1
+    assert replay["input"][0]["name"] == EXPLORE_TOOL_NAME
+    assert replay["input"][1]["output"] == "ONCE"
+
+
+@pytest.mark.asyncio
+async def test_inbound_restores_explore_name_even_when_output_not_pruned():
+    svc = ExploreToolService(reducer=FakeTextReducer(), min_chars_to_prune=5000)
+    rewritten = svc.rewrite_outbound_items([_explore_call()], session_key="s")
+    body = {"input": [rewritten[0], _output("c1", "short")]}
+    changed = await svc.prune_inbound(body, session_key="s")
+    assert changed is True
+    assert body["input"][0]["name"] == EXPLORE_TOOL_NAME
+    assert body["input"][1]["output"] == "short"
+
+
 def test_tool_output_truncation_markers():
     assert tool_output_looks_truncated("tokens truncated")
     assert not tool_output_looks_truncated("normal output")
@@ -366,6 +443,9 @@ def test_store_ttl_preserves_pruned_on_upsert():
             focus_question="q?",
             created_at=now,
             pruned_output="cached",
+            explore_path="/tmp/app.py",
+            explore_start_line=1,
+            explore_end_line=50,
         ),
     )
     store.upsert(
@@ -378,7 +458,11 @@ def test_store_ttl_preserves_pruned_on_upsert():
             pruned_output=None,
         ),
     )
-    assert store.get("s", "c").pruned_output == "cached"
+    rec = store.get("s", "c")
+    assert rec.pruned_output == "cached"
+    assert rec.explore_path == "/tmp/app.py"
+    assert rec.explore_start_line == 1
+    assert rec.explore_end_line == 50
 
 
 def test_factory_disabled_returns_none():

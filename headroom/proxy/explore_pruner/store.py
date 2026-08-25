@@ -16,6 +16,9 @@ class ExplorePrunerRecord:
     focus_question: str | None
     created_at: float
     pruned_output: str | None = None
+    explore_path: str | None = None
+    explore_start_line: int | None = None
+    explore_end_line: int | None = None
 
 
 class ExplorePrunerStore:
@@ -36,13 +39,23 @@ class ExplorePrunerStore:
         with self._lock:
             self._purge_locked()
             existing = self._entries.get(key)
-            # Outbound re-register often omits pruned_output; keep cache.
-            if (
-                existing is not None
-                and record.pruned_output is None
-                and existing.pruned_output is not None
-            ):
-                record.pruned_output = existing.pruned_output
+            if existing is not None:
+                # Outbound re-register often omits pruned_output; keep cache.
+                if record.pruned_output is None and existing.pruned_output is not None:
+                    record.pruned_output = existing.pruned_output
+                # Inbound prune upserts without explore args; keep restore fields.
+                if record.explore_path is None and existing.explore_path is not None:
+                    record.explore_path = existing.explore_path
+                if (
+                    record.explore_start_line is None
+                    and existing.explore_start_line is not None
+                ):
+                    record.explore_start_line = existing.explore_start_line
+                if (
+                    record.explore_end_line is None
+                    and existing.explore_end_line is not None
+                ):
+                    record.explore_end_line = existing.explore_end_line
             self._entries[key] = record
             if len(self._entries) > self._max_entries:
                 overflow = len(self._entries) - self._max_entries
