@@ -11,6 +11,7 @@ import httpx
 from headroom.proxy.explore_pruner.ast_protect import (
     CodeAstProtectSettings,
     rebuild_python_from_pruned,
+    rewrite_legacy_filtered_markers,
 )
 from headroom.proxy.explore_pruner.pruner_types import reduce_result_to_pruner_result
 from headroom.proxy.explore_pruner.types import ReduceInput, ReduceResult, parse_swe_pruner_response
@@ -87,7 +88,12 @@ class SwePrunerReducer:
     ) -> ReduceResult:
         """Round up kept_frags to complete statements; return final text-only result."""
         if not self._ast_protect_enabled or not raw.kept_frags:
-            return ReduceResult(content=raw.content, metadata=dict(raw.metadata))
+            return ReduceResult(
+                content=rewrite_legacy_filtered_markers(raw.content),
+                kept_frags=list(raw.kept_frags),
+                token_scores=list(raw.token_scores),
+                metadata=dict(raw.metadata),
+            )
 
         commands_raw = inp.config.get("commands")
         commands = commands_raw if isinstance(commands_raw, list) else []
@@ -111,11 +117,15 @@ class SwePrunerReducer:
             )
             return ReduceResult(
                 content=rebuilt.text,
+                kept_frags=list(raw.kept_frags),
+                token_scores=list(raw.token_scores),
                 metadata={**raw.metadata, "ast_rebuild": True},
             )
 
         use_pruned = self._ast_settings.rebuild_fallback == "pruned"
         fallback = raw.content if use_pruned else inp.content
+        if use_pruned:
+            fallback = rewrite_legacy_filtered_markers(fallback)
         logger.info(
             "swe_pruner ast_rebuild fallback_%s reason=%s",
             "pruned" if use_pruned else "original",
@@ -123,6 +133,8 @@ class SwePrunerReducer:
         )
         return ReduceResult(
             content=fallback,
+            kept_frags=list(raw.kept_frags),
+            token_scores=list(raw.token_scores),
             metadata={**raw.metadata, "ast_rebuild": False, "ast_skip_reason": rebuilt.skip_reason},
         )
 

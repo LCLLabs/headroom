@@ -131,6 +131,51 @@ def test_omission_marker_emits_coact_shape():
     assert _omission_marker(19, "    ") == "    (compressed 19 lines: omitted)"
 
 
+def test_rewrite_legacy_filtered_markers_to_coact_shape():
+    from headroom.proxy.explore_pruner.ast_protect import rewrite_legacy_filtered_markers
+
+    text = "(filtered 12 lines)\ndef foo():\n(filtered 1 lines)\n"
+    out = rewrite_legacy_filtered_markers(text)
+    assert out == (
+        "(compressed 12 lines: omitted)\ndef foo():\n(compressed 1 lines: omitted)\n"
+    )
+    # Already CoACT-shaped text is left alone.
+    coact = "(compressed 4 lines: imports)\nx = 1\n"
+    assert rewrite_legacy_filtered_markers(coact) == coact
+
+
+@pytest.mark.asyncio
+async def test_swe_pruner_fallback_rewrites_filtered_markers():
+    from headroom.proxy.explore_pruner.reducers.swe_pruner import SwePrunerReducer
+
+    reducer = SwePrunerReducer(
+        api_base="http://127.0.0.1:9",
+        ast_protect_enabled=True,
+        rebuild_fallback="pruned",
+    )
+    raw = ReduceResult(
+        content="(filtered 12 lines)\ndef is_separable(transform):\n    return True\n",
+        kept_frags=[13],
+    )
+    rebuilt = MagicMock()
+    rebuilt.text = None
+    rebuilt.skip_reason = "rebuild_syntax"
+    rebuilt.leaf_count = 0
+    rebuilt.kept_count = 0
+    with patch(
+        "headroom.proxy.explore_pruner.reducers.swe_pruner.rebuild_python_from_pruned",
+        return_value=rebuilt,
+    ):
+        out = reducer._apply_ast_rebuild(
+            ReduceInput(content="x = 0\n", query="Why?", config={"commands": ["sed"]}),
+            raw,
+        )
+    assert out.metadata["ast_rebuild"] is False
+    assert out.metadata["ast_skip_reason"] == "rebuild_syntax"
+    assert "(filtered" not in out.content
+    assert out.content.startswith("(compressed 12 lines: omitted)")
+
+
 def test_omission_parser_accepts_coact_and_legacy_filtered():
     from headroom.proxy.explore_pruner.ast_protect import _parse_virtual_kept_lines
 

@@ -30,6 +30,11 @@ _OMISSION_COUNT_RE = re.compile(
     re.IGNORECASE,
 )
 _OMISSION_MARKER = "(compressed {n} lines: omitted)"
+# Rewrite only legacy swe HTTP markers; leave CoACT ``compressed …: desc`` alone.
+_LEGACY_FILTERED_REWRITE_RE = re.compile(
+    r"\(\s*filtered\s+(\d+)\s+lines?\s*\)",
+    re.IGNORECASE,
+)
 # Back-compat aliases used by older call sites / tests.
 _FILTERED_RE = _OMISSION_MARKER_RE
 _FILTERED_COUNT_RE = _OMISSION_COUNT_RE
@@ -903,6 +908,21 @@ def _maybe_expand_to_functions(
 def _omission_marker(n: int, indent: str = "") -> str:
     """Emit a CoACT-compatible omission placeholder (generic summary)."""
     return f"{indent}{_OMISSION_MARKER.format(n=n)}"
+
+
+def rewrite_legacy_filtered_markers(text: str) -> str:
+    """Map swe-pruner HTTP ``(filtered N lines)`` to CoACT-shaped markers.
+
+    Used when AST rebuild is skipped or falls back to the HTTP pruned text, so
+    upstream still sees ``(compressed N lines: omitted)`` instead of legacy
+    ``filtered`` wording.
+    """
+    if not text or "filtered" not in text.lower():
+        return text
+    return _LEGACY_FILTERED_REWRITE_RE.sub(
+        lambda m: _OMISSION_MARKER.format(n=m.group(1)),
+        text,
+    )
 
 
 def _filtered_marker(n: int, indent: str = "") -> str:
