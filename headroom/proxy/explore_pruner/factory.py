@@ -7,6 +7,12 @@ import os
 
 from headroom.proxy.explore_pruner.ast_protect import CodeAstProtectSettings, init_tree_sitter
 from headroom.proxy.explore_pruner.protocol import get_reducer, register_reducer
+from headroom.proxy.explore_pruner.reducers.coact import (
+    COACT_DEFAULT_API_BASE,
+    COACT_DEFAULT_TIMEOUT_SECONDS,
+    COACT_NAME,
+    CoactReducer,
+)
 from headroom.proxy.explore_pruner.reducers.swe_pruner import SWE_PRUNER_NAME, SwePrunerReducer
 from headroom.proxy.explore_pruner.service import ExploreToolService
 from headroom.proxy.explore_pruner.store import ExplorePrunerStore
@@ -101,6 +107,22 @@ def _build_swe_pruner_reducer(cfg: ExplorePrunerConfig) -> SwePrunerReducer:
     )
 
 
+def _build_coact_reducer(cfg: ExplorePrunerConfig) -> CoactReducer:
+    """Construct CoACT reducer. No AST. Default port 8002 / 120s when swe defaults remain."""
+    defaults = ExplorePrunerConfig()
+    api_base = cfg.api_base
+    if api_base == defaults.api_base:
+        api_base = COACT_DEFAULT_API_BASE
+    timeout = cfg.timeout_seconds
+    if timeout == defaults.timeout_seconds:
+        timeout = COACT_DEFAULT_TIMEOUT_SECONDS
+    return CoactReducer(
+        api_base=api_base,
+        api_key=cfg.api_key,
+        timeout_seconds=timeout,
+    )
+
+
 def build_explore_tool_service(cfg: ExplorePrunerConfig) -> ExploreToolService | None:
     """Construct and register an ExploreToolService, or None when disabled."""
     if not cfg.enabled:
@@ -111,13 +133,15 @@ def build_explore_tool_service(cfg: ExplorePrunerConfig) -> ExploreToolService |
     if reducer is None:
         if reducer_name == SWE_PRUNER_NAME:
             reducer = _build_swe_pruner_reducer(cfg)
-            register_reducer(reducer)
+        elif reducer_name == COACT_NAME:
+            reducer = _build_coact_reducer(cfg)
         else:
             logger.error(
                 "explore_pruner unknown reducer=%r; feature disabled",
                 reducer_name,
             )
             return None
+        register_reducer(reducer)
 
     store = ExplorePrunerStore(
         ttl_seconds=cfg.store_ttl_seconds,

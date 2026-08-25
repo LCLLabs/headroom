@@ -94,3 +94,32 @@ def parse_swe_pruner_response(data: dict[str, Any]) -> ReduceResult | None:
             "left_token_cnt": int(left) if isinstance(left, int) else None,
         },
     )
+
+
+def _optional_int(raw: Any) -> int | None:
+    return int(raw) if isinstance(raw, int) and not isinstance(raw, bool) else None
+
+
+def parse_coact_response(data: dict[str, Any]) -> ReduceResult | None:
+    """Build a ReduceResult from a successful CoACT JSON body.
+
+    ``compression_type: "invalid"`` and empty ``pruned_code`` are failures.
+    ``unchanged`` / ``plain`` / ``code`` (or a missing type) are success.
+    """
+    pruned = data.get("pruned_code")
+    if not isinstance(pruned, str) or not pruned:
+        return None
+    compression_type = data.get("compression_type")
+    if compression_type == "invalid":
+        return None
+    return ReduceResult(
+        content=pruned,
+        kept_frags=parse_kept_frags(data.get("kept_frags")),
+        metadata={
+            "backend": "coact",
+            "compression_type": compression_type if isinstance(compression_type, str) else None,
+            "origin_token_cnt": _optional_int(data.get("origin_token_cnt")),
+            "left_token_cnt": _optional_int(data.get("left_token_cnt")),
+            "model_input_token_cnt": _optional_int(data.get("model_input_token_cnt")),
+        },
+    )

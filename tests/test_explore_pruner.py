@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import time
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -59,6 +59,16 @@ class FakeKeptFragsReducer:
             content="(filtered 1 lines)\nx = 1\n",
             kept_frags=[2],
         )
+
+
+def _mock_async_httpx(response: MagicMock) -> tuple[AsyncMock, AsyncMock]:
+    """Return (AsyncClient context manager, client) with ``client.post`` mocked."""
+    mock_client = AsyncMock()
+    mock_client.post = AsyncMock(return_value=response)
+    mock_cm = AsyncMock()
+    mock_cm.__aenter__.return_value = mock_client
+    mock_cm.__aexit__.return_value = None
+    return mock_cm, mock_client
 
 
 def _long_py(n: int = 1200) -> str:
@@ -264,6 +274,186 @@ async def test_swe_pruner_reduce_applies_ast_after_http():
         )
     assert out is not None
     assert out.content == "FROM_AST\n"
+
+
+def test_parse_coact_response_code_type():
+    from headroom.proxy.explore_pruner.types import parse_coact_response
+
+    result = parse_coact_response(
+        {
+            "pruned_code": "def validate():\n    return x\n",
+            "origin_token_cnt": 511,
+            "left_token_cnt": 78,
+            "model_input_token_cnt": 1368,
+            "kept_frags": [20, 21],
+            "compression_type": "code",
+            "error_msg": None,
+        }
+    )
+    assert result is not None
+    assert result.content.startswith("def validate")
+    assert result.kept_frags == [20, 21]
+    assert result.metadata["backend"] == "coact"
+    assert result.metadata["compression_type"] == "code"
+    assert result.metadata["origin_token_cnt"] == 511
+    assert result.metadata["left_token_cnt"] == 78
+    assert result.metadata["model_input_token_cnt"] == 1368
+
+
+def test_parse_coact_response_plain_and_unchanged():
+    from headroom.proxy.explore_pruner.types import parse_coact_response
+
+    plain = parse_coact_response(
+        {
+            "pruned_code": "3 tests passed; no failure traceback was present.",
+            "compression_type": "plain",
+        }
+    )
+    assert plain is not None
+    assert plain.content.startswith("3 tests passed")
+    assert plain.metadata["compression_type"] == "plain"
+
+    unchanged = parse_coact_response(
+        {
+            "pruned_code": "def foo(): pass\n",
+            "compression_type": "unchanged",
+        }
+    )
+    assert unchanged is not None
+    assert unchanged.content == "def foo(): pass\n"
+    assert unchanged.metadata["compression_type"] == "unchanged"
+
+
+def test_parse_coact_response_rejects_invalid_and_empty():
+    from headroom.proxy.explore_pruner.types import parse_coact_response
+
+    assert (
+        parse_coact_response(
+            {"pruned_code": "same as original", "compression_type": "invalid"}
+        )
+        is None
+    )
+    assert parse_coact_response({"pruned_code": "", "compression_type": "code"}) is None
+    assert parse_coact_response({"compression_type": "code"}) is None
+
+
+@pytest.mark.asyncio
+async def test_coact_payload_maps_query_code_goal_and_tool_call():
+    from headroom.proxy.explore_pruner.reducers.coact import CoactReducer
+
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.json.return_value = {
+        "pruned_code": "kept",
+        "compression_type": "code",
+        "error_msg": None,
+        "kept_frags": [1],
+    }
+    mock_cm, mock_client = _mock_async_httpx(mock_response)
+    reducer = CoactReducer(api_base="http://127.0.0.1:8002")
+    with patch(
+        "headroom.proxy.explore_pruner.reducers.coact.httpx.AsyncClient",
+        return_value=mock_cm,
+    ):
+        await reducer.reduce(
+            ReduceInput(
+                content="def foo(): pass",
+                query="Where is foo?",
+                config={
+                    "commands": ["sed -n '1,80p' src/utils.py"],
+                    "goal": "Fix empty string validation",
+                },
+            )
+        )
+    mock_client.post.assert_called_once()
+    payload = mock_client.post.call_args.kwargs["json"]
+    assert payload["query"] == "Where is foo?"
+    assert payload["code"] == "def foo(): pass"
+    assert payload["goal"] == "Fix empty string validation"
+    assert payload["tool_call"] == "sed -n '1,80p' src/utils.py"
+    assert "threshold" not in payload
+
+
+@pytest.mark.asyncio
+async def test_coact_reduce_returns_pruned_without_ast():
+    from headroom.proxy.explore_pruner.reducers.coact import CoactReducer
+
+    pruned = "(compressed 19 lines: imports)\ndef validate():\n    return x\n"
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.json.return_value = {
+        "pruned_code": pruned,
+        "kept_frags": [20, 21, 22],
+        "compression_type": "code",
+        "error_msg": None,
+        "origin_token_cnt": 511,
+        "left_token_cnt": 78,
+    }
+    mock_cm, _client = _mock_async_httpx(mock_response)
+    reducer = CoactReducer(api_base="http://127.0.0.1:8002")
+    with (
+        patch(
+            "headroom.proxy.explore_pruner.reducers.coact.httpx.AsyncClient",
+            return_value=mock_cm,
+        ),
+        patch(
+            "headroom.proxy.explore_pruner.ast_protect.rebuild_python_from_pruned",
+        ) as mock_ast,
+    ):
+        out = await reducer.reduce(
+            ReduceInput(content="x = 0\nx = 1\n", query="Why?", config={"commands": []})
+        )
+    mock_ast.assert_not_called()
+    assert out is not None
+    assert out.content == pruned
+    assert out.kept_frags == [20, 21, 22]
+    assert out.metadata["compression_type"] == "code"
+
+
+@pytest.mark.asyncio
+async def test_coact_reduce_fail_open_on_error_msg_invalid_and_http():
+    from headroom.proxy.explore_pruner.reducers.coact import CoactReducer
+
+    reducer = CoactReducer(api_base="http://127.0.0.1:8002")
+    inp = ReduceInput(content="def foo(): pass", query="Where is foo?")
+
+    error_resp = MagicMock()
+    error_resp.status_code = 200
+    error_resp.json.return_value = {
+        "pruned_code": "def foo(): pass",
+        "error_msg": "backend failed",
+        "compression_type": "invalid",
+    }
+    mock_cm, _ = _mock_async_httpx(error_resp)
+    with patch(
+        "headroom.proxy.explore_pruner.reducers.coact.httpx.AsyncClient",
+        return_value=mock_cm,
+    ):
+        assert await reducer.reduce(inp) is None
+
+    invalid_resp = MagicMock()
+    invalid_resp.status_code = 200
+    invalid_resp.json.return_value = {
+        "pruned_code": "def foo(): pass",
+        "error_msg": None,
+        "compression_type": "invalid",
+    }
+    mock_cm, _ = _mock_async_httpx(invalid_resp)
+    with patch(
+        "headroom.proxy.explore_pruner.reducers.coact.httpx.AsyncClient",
+        return_value=mock_cm,
+    ):
+        assert await reducer.reduce(inp) is None
+
+    http_resp = MagicMock()
+    http_resp.status_code = 500
+    http_resp.content = b"boom"
+    mock_cm, _ = _mock_async_httpx(http_resp)
+    with patch(
+        "headroom.proxy.explore_pruner.reducers.coact.httpx.AsyncClient",
+        return_value=mock_cm,
+    ):
+        assert await reducer.reduce(inp) is None
 
 
 @pytest.mark.asyncio
@@ -491,6 +681,46 @@ def test_factory_builds_swe_pruner(monkeypatch):
     reducer = get_reducer("swe_pruner")
     assert isinstance(reducer, SwePrunerReducer)
     assert reducer._ast_protect_enabled is False
+
+
+def test_factory_builds_coact_without_tree_sitter(monkeypatch):
+    from headroom.proxy.explore_pruner.factory import build_explore_tool_service
+    from headroom.proxy.explore_pruner.reducers.coact import CoactReducer
+
+    def _tree_sitter_must_not_run() -> bool:
+        raise AssertionError("tree-sitter should not be used for coact")
+
+    monkeypatch.setattr(
+        "headroom.proxy.explore_pruner.factory.init_tree_sitter",
+        _tree_sitter_must_not_run,
+    )
+    svc = build_explore_tool_service(
+        ExplorePrunerConfig(
+            enabled=True,
+            reducer="coact",
+            api_base="http://127.0.0.1:9",
+            timeout_seconds=90.0,
+            ast_protect_enabled=True,
+        )
+    )
+    assert svc is not None
+    assert svc.reducer_name == "coact"
+    reducer = get_reducer("coact")
+    assert isinstance(reducer, CoactReducer)
+    assert reducer._url == "http://127.0.0.1:9/prune"
+    assert reducer._timeout == 90.0
+
+
+def test_factory_coact_defaults_port_8002_and_120s_timeout():
+    from headroom.proxy.explore_pruner.factory import build_explore_tool_service
+    from headroom.proxy.explore_pruner.reducers.coact import CoactReducer
+
+    svc = build_explore_tool_service(ExplorePrunerConfig(enabled=True, reducer="coact"))
+    assert svc is not None
+    reducer = get_reducer("coact")
+    assert isinstance(reducer, CoactReducer)
+    assert reducer._url == "http://127.0.0.1:8002/prune"
+    assert reducer._timeout == 120.0
 
 
 def test_stream_rewriter_renames_added_and_rewrites_done():

@@ -27,12 +27,19 @@ from headroom.proxy.explore_pruner.protocol import (
     register_reducer,
     registered_reducer_names,
 )
-from headroom.proxy.explore_pruner.reducers import SWE_PRUNER_NAME, SwePrunerReducer
+from headroom.proxy.explore_pruner.reducers import (
+    COACT_NAME,
+    SWE_PRUNER_NAME,
+    CoactReducer,
+    SwePrunerReducer,
+)
 from headroom.proxy.explore_pruner.service import ExploreToolService
 from headroom.proxy.explore_pruner.store import ExplorePrunerRecord, ExplorePrunerStore
 from headroom.proxy.explore_pruner.types import ReduceInput, ReduceResult
 
 __all__ = [
+    "COACT_NAME",
+    "CoactReducer",
     "CodeAstProtectSettings",
     "ContextReducer",
     "EXPLORE_TOOL_INSTRUCTIONS",

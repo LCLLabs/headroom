@@ -138,7 +138,7 @@ class ExplorePrunerConfig:
     """Explore-tool + pluggable context reducer (OpenAI Responses path)."""
 
     enabled: bool = False
-    reducer: str = "swe_pruner"
+    reducer: str = "swe_pruner"  # swe_pruner | coact
     min_chars_to_prune: int = 1000
     focus_max_chars: int = 500
     explore_max_lines: int = 400
