@@ -56,7 +56,7 @@ class FakeKeptFragsReducer:
 
     async def reduce(self, inp: ReduceInput) -> ReduceResult | None:
         return ReduceResult(
-            content="(filtered 1 lines)\nx = 1\n",
+            content="(compressed 1 lines: omitted)\nx = 1\n",
             kept_frags=[2],
         )
 
@@ -114,12 +114,39 @@ def test_inject_tool_and_instructions_no_dup():
     svc.prepare_request(body)
     assert any(t.get("name") == EXPLORE_TOOL_NAME for t in body["tools"])
     assert EXPLORE_TOOL_INSTRUCTIONS in body["instructions"]
+    assert "(compressed N lines: <brief summary>)" in body["instructions"]
+    assert "(filtered N lines)" not in body["instructions"]
     tools_len = len(body["tools"])
     instr = body["instructions"]
     svc.prepare_request(body)
     assert len(body["tools"]) == tools_len
     assert body["instructions"].count(EXPLORE_TOOL_INSTRUCTIONS) == 1
     assert body["instructions"] == instr
+
+
+def test_omission_marker_emits_coact_shape():
+    from headroom.proxy.explore_pruner.ast_protect import _omission_marker
+
+    assert _omission_marker(4) == "(compressed 4 lines: omitted)"
+    assert _omission_marker(19, "    ") == "    (compressed 19 lines: omitted)"
+
+
+def test_omission_parser_accepts_coact_and_legacy_filtered():
+    from headroom.proxy.explore_pruner.ast_protect import _parse_virtual_kept_lines
+
+    coact = _parse_virtual_kept_lines(
+        "(compressed 2 lines: imports)\n"
+        "def foo():\n"
+        "    return 1\n"
+        "(compressed 3 lines: helpers)\n"
+    )
+    assert coact == [(3, "def foo():"), (4, "    return 1")]
+
+    legacy = _parse_virtual_kept_lines(
+        "(filtered 1 lines)\n"
+        "x = 1\n"
+    )
+    assert legacy == [(2, "x = 1")]
 
 
 def test_append_explore_tool_idempotent():
@@ -199,7 +226,7 @@ async def test_kept_frags_reducer_not_ast_processed_by_service():
     svc.rewrite_outbound_items([_explore_call()], session_key="s")
     body = {"input": [_output("c1", "x = 0\nx = 1\nx = 2\n" * 20)]}
     await svc.prune_inbound(body, session_key="s")
-    assert body["input"][0]["output"] == "(filtered 1 lines)\nx = 1\n"
+    assert body["input"][0]["output"] == "(compressed 1 lines: omitted)\nx = 1\n"
 
 
 @pytest.mark.asyncio
@@ -211,7 +238,7 @@ async def test_swe_pruner_ast_rebuild():
         ast_protect_enabled=True,
     )
     raw = ReduceResult(
-        content="(filtered 1 lines)\nx = 1\n",
+        content="(compressed 1 lines: omitted)\nx = 1\n",
         kept_frags=[2],
     )
     rebuilt = MagicMock()
@@ -245,7 +272,7 @@ async def test_swe_pruner_reduce_applies_ast_after_http():
     mock_response = MagicMock()
     mock_response.status_code = 200
     mock_response.json.return_value = {
-        "pruned_code": "(filtered 1 lines)\nx = 1\n",
+        "pruned_code": "(compressed 1 lines: omitted)\nx = 1\n",
         "kept_frags": [2],
     }
     mock_client = AsyncMock()

@@ -26,8 +26,9 @@ TRUNCATED_OUTPUT_MARKERS = (
 )
 
 EXPLORE_OUTPUT_FORMAT_HINT = (
-    "Omitted regions appear as `(filtered N lines)` where N is the number of "
-    "original source lines dropped; surrounding code structure is kept."
+    "Omitted regions appear as `(compressed N lines: <brief summary>)` where N "
+    "is the number of original source lines dropped; surrounding code structure "
+    "is kept."
 )
 
 EXPLORE_TOOL_INSTRUCTIONS = (

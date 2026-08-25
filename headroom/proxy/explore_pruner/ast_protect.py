@@ -20,11 +20,20 @@ from headroom.proxy.explore_pruner.score_retention import ScoreRetentionSettings
 
 logger = logging.getLogger(__name__)
 
-_FILTERED_RE = re.compile(r"\(\s*filtered\s+\d+\s+lines?\s*\)", re.IGNORECASE)
-_FILTERED_COUNT_RE = re.compile(
-    r"\(\s*filtered\s+(\d+)\s+lines?\s*\)", re.IGNORECASE
+# CoACT-style omission markers, plus legacy swe-pruner ``(filtered N lines)``.
+_OMISSION_MARKER_RE = re.compile(
+    r"\(\s*(?:filtered|compressed)\s+\d+\s+lines?(?:\s*:\s*[^)]*)?\s*\)",
+    re.IGNORECASE,
 )
-_FILTERED_MARKER = "(filtered {n} lines)"
+_OMISSION_COUNT_RE = re.compile(
+    r"\(\s*(?:filtered|compressed)\s+(\d+)\s+lines?(?:\s*:\s*[^)]*)?\s*\)",
+    re.IGNORECASE,
+)
+_OMISSION_MARKER = "(compressed {n} lines: omitted)"
+# Back-compat aliases used by older call sites / tests.
+_FILTERED_RE = _OMISSION_MARKER_RE
+_FILTERED_COUNT_RE = _OMISSION_COUNT_RE
+_FILTERED_MARKER = _OMISSION_MARKER
 # cat -n / nl / GitHub: consume the number + separator, keep the original indent
 _LINE_NUM_PREFIX = re.compile(r"^(\s*\d+)(?:\t+|\|(?:\s)?|:(?:\s)?| )")
 _FILE_BANNER = re.compile(r"^==>\s+.*\s+<==\s*$")
@@ -485,7 +494,7 @@ def _collect_leaves(node: Any) -> list[_Leaf]:
 
 
 def _split_fragments(pruned: str) -> list[str]:
-    parts = _FILTERED_RE.split(pruned)
+    parts = _OMISSION_MARKER_RE.split(pruned)
     return [p for p in parts if p.strip()]
 
 
@@ -513,13 +522,14 @@ def _line_byte_span(code_bytes: bytes, line_no: int) -> tuple[int, int] | None:
 def _parse_virtual_kept_lines(pruned: str) -> list[tuple[int, str]]:
     """Walk pruner output; map each kept line to its original 1-based line number.
 
-    ``(filtered N lines)`` advances the counter by N without emitting a kept line.
+    ``(compressed N lines: …)`` / legacy ``(filtered N lines)`` advances the
+    counter by N without emitting a kept line.
     """
     orig_line = 1
     kept: list[tuple[int, str]] = []
     for raw_line in pruned.splitlines():
         stripped = raw_line.strip()
-        marker = _FILTERED_COUNT_RE.fullmatch(stripped) if stripped else None
+        marker = _OMISSION_COUNT_RE.fullmatch(stripped) if stripped else None
         if marker:
             orig_line += int(marker.group(1))
             continue
@@ -537,7 +547,7 @@ def _virtual_timeline_anchored(
     if not specs:
         return False
     first_physical = pruned.lstrip().splitlines()[0].strip() if pruned.strip() else ""
-    if first_physical and _FILTERED_COUNT_RE.fullmatch(first_physical):
+    if first_physical and _OMISSION_COUNT_RE.fullmatch(first_physical):
         return True
     first_line_no, first_text = specs[0]
     if first_line_no != 1:
@@ -553,8 +563,8 @@ def _align_leaves_by_virtual_lines(
     pruned: str,
     leaves: list[_Leaf],
 ) -> set[tuple[int, int]]:
-    """Align pruned lines via ``(filtered N lines)`` virtual timeline."""
-    if not _FILTERED_RE.search(pruned):
+    """Align pruned lines via ``(compressed|filtered N lines…)`` virtual timeline."""
+    if not _OMISSION_MARKER_RE.search(pruned):
         return set()
 
     specs = _parse_virtual_kept_lines(pruned)
@@ -890,8 +900,14 @@ def _maybe_expand_to_functions(
     return expanded
 
 
+def _omission_marker(n: int, indent: str = "") -> str:
+    """Emit a CoACT-compatible omission placeholder (generic summary)."""
+    return f"{indent}{_OMISSION_MARKER.format(n=n)}"
+
+
 def _filtered_marker(n: int, indent: str = "") -> str:
-    return f"{indent}{_FILTERED_MARKER.format(n=n)}"
+    """Backward-compatible alias for :func:`_omission_marker`."""
+    return _omission_marker(n, indent)
 
 
 def _subtree_kept(node: Any, kept: set[tuple[int, int]]) -> bool:
@@ -950,7 +966,7 @@ class _EmitCtx:
             return
         n = _span_line_count(self.code_bytes, start, end)
         if n > 0:
-            parts.append(_filtered_marker(n, indent))
+            parts.append(_omission_marker(n, indent))
 
     def _note_gap(self, gap: list[int | None], node: Any) -> None:
         if not self.markers:
