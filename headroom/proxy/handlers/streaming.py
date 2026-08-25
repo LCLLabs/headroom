@@ -27,6 +27,7 @@ if TYPE_CHECKING:
 import httpx
 
 from headroom.copilot_auth import apply_copilot_api_auth
+from headroom.proxy.stream_output_tokens import estimate_output_tokens
 
 logger = logging.getLogger("headroom.proxy")
 
@@ -952,11 +953,27 @@ class StreamingMixin:
         output_tokens = stream_state["output_tokens"]
         output_tokens_source = "provider"
         if output_tokens is None:
-            output_tokens = stream_state["total_bytes"] // 40
-            output_tokens_source = "estimated_bytes"
+            # No usage chunk from the upstream. Count the stream's OWN TEXT
+            # rather than dividing the raw wire by a constant: `total_bytes`
+            # includes every `data:` prefix, JSON envelope and framing newline,
+            # so its error tracked how chattily the answer was chunked instead
+            # of how long the answer was. Falls back to the byte heuristic only
+            # when no text could be recovered at all.
+            output_tokens, output_tokens_source = estimate_output_tokens(
+                sse_text=full_sse_data,
+                total_bytes=stream_state["total_bytes"],
+            )
+            # Name the actual basis. The old message always said "from N bytes"
+            # even though that is now only true for the fallback rung, and an
+            # operator reading it needs to know which estimate they are looking
+            # at before trusting the number.
+            basis = (
+                "counted from stream text"
+                if output_tokens_source == "estimated_text"
+                else f"estimated from {stream_state['total_bytes']} raw SSE bytes"
+            )
             logger.warning(
-                f"[{request_id}] Could not parse output_tokens from SSE, "
-                f"estimating {output_tokens} from {stream_state['total_bytes']} bytes"
+                f"[{request_id}] No usage chunk in SSE; output_tokens={output_tokens} ({basis})"
             )
 
         outcome_tags = dict(tags or {})
@@ -1340,11 +1357,22 @@ class StreamingMixin:
             if upstream_response is None:
                 raise last_connect_error or RuntimeError("upstream connection did not start")
         # Retries exhausted (or a transport failure escaped the loop): emit a
-        # clean SSE error instead of letting an h2 StreamReset bubble up as a
-        # 502. Covers ConnectError/timeouts and Local/RemoteProtocolError. (#1639)
+        # clean SSE error instead of letting an h2 StreamReset bubble up as an
+        # unhandled 502. Covers ConnectError/timeouts and Local/RemoteProtocol-
+        # Error. (#1639)
+        #
+        # The status MUST stay non-2xx. No body byte has been forwarded yet, so
+        # the status line is still ours to set, and a 200 here is
+        # indistinguishable — to every Anthropic/OpenAI SDK — from a successful
+        # stream that produced no events: the client reports "empty or malformed
+        # response (HTTP 200)" and cannot retry, because 200 is not retryable.
+        # 502 keeps the structured SSE body for clients that read it while
+        # letting SDK retry logic treat a transient upstream transport failure
+        # as what it is.
         except httpx.TransportError as e:
             error_msg = str(e) or repr(e)
             logger.error(f"[{request_id}] Connection error to upstream API: {error_msg}")
+            self.metrics.record_upstream_connection_error(provider)
 
             async def _error_gen():
                 error_event = {
@@ -1357,7 +1385,11 @@ class StreamingMixin:
                 yield f"event: error\ndata: {json.dumps(error_event)}\n\n".encode()
 
             self._cleanup_mid_turn_stream(session_key)
-            return StreamingResponse(_error_gen(), media_type="text/event-stream")
+            return StreamingResponse(
+                _error_gen(),
+                status_code=502,
+                media_type="text/event-stream",
+            )
 
         # Capture Codex rate-limit window data from the upstream response
         # headers, for *every* status. Codex (gpt-5.x) almost always streams, so
