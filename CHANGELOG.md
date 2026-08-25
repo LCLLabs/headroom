@@ -284,6 +284,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **code:** fix two `CodeAwareCompressor` AST-reassembly bugs: an exported JS/TS function or class (`export function foo() {`) produced a duplicated `export export` keyword and invalid syntax, because line-based node slicing (used to preserve indentation) pulled in the preceding `export` sibling's text on top of the `export_statement` handler's own prefix reconstruction. Separately, in every supported language, a doc comment immediately above a top-level function, class, or type was detached from its declaration during extraction and re-emitted in a cluster at the end of the compressed output instead of staying attached to what it documents.
 - * **proxy:** Buffered upstream responses containing a `server_tool_use` (or any other unrecognized Anthropic content block) no longer turn a fully-generated response into an HTTP 502. `StreamingMixin._response_to_sse` raised `ValueError` on unknown block types after the entire upstream generation had already been buffered, so a slow-but-successful response failed and the client retried the whole multi-minute request. Unknown blocks are now emitted verbatim in `content_block_start` (following the existing redacted_thinking` pattern), so `server_tool_use`, `server_tool_result`, `mcp_tool_use`, and future block types round-trip ([#1806](https://github.com/headroomlabs-ai/headroom/issues/1806)).
 
+## [0.36.6](https://github.com/headroomlabs-ai/headroom/compare/v0.36.5...v0.36.6) (2026-08-25)
+
+
+### Bug Fixes
+
+* **cache/semantic:** don't semantic-match an empty query across contexts ([#3226](https://github.com/headroomlabs-ai/headroom/issues/3226)) ([455f4f2](https://github.com/headroomlabs-ai/headroom/commit/455f4f263ce2638ff387c52d42601760f5cf0784))
+* **kimi:** route managed Kimi Code through the proxy ([#3223](https://github.com/headroomlabs-ai/headroom/issues/3223)) ([701e461](https://github.com/headroomlabs-ai/headroom/commit/701e4616d92d6d4b110bf5356675b6db409802e8))
+* **mcp:** add explicit Serena reconciliation ([#3222](https://github.com/headroomlabs-ai/headroom/issues/3222)) ([7550efb](https://github.com/headroomlabs-ai/headroom/commit/7550efb68fde6acf0674244b03eb268b976ffced))
+* **proxy:** make output-savings flush atomic and keep it off the event loop ([#3231](https://github.com/headroomlabs-ai/headroom/issues/3231)) ([b9d7dcc](https://github.com/headroomlabs-ai/headroom/commit/b9d7dcc3da3ec67a968d0ac1e35bffba9b7cf1c2))
+* **proxy:** protect file reads from lossy compression on the Responses API path (Copilot view + HEADROOM_PROTECT_READS) ([#3238](https://github.com/headroomlabs-ai/headroom/issues/3238)) ([4408e88](https://github.com/headroomlabs-ai/headroom/commit/4408e881064741a5113be69d631f336ce92631f5))
+* **transforms:** stop folding datetime-prefixed user messages as search results ([#3221](https://github.com/headroomlabs-ai/headroom/issues/3221)) ([7784bb1](https://github.com/headroomlabs-ai/headroom/commit/7784bb184614bdcd7ba1afd93a23e8d1458ecc96))
+* **wrap:** stop concurrent wrap sessions clobbering settings.local.json ([#3232](https://github.com/headroomlabs-ai/headroom/issues/3232)) ([f27f235](https://github.com/headroomlabs-ai/headroom/commit/f27f235032d8aef522efbcb4daf548787692c7e4))
+
 ## [0.36.5](https://github.com/headroomlabs-ai/headroom/compare/v0.36.4...v0.36.5) (2026-08-22)
 
 
