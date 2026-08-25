@@ -76,6 +76,7 @@ _LOGS_DIR = "logs"
 _PROXY_LOG_FILE = "proxy.log"
 _DEBUG_400_DIR = "debug_400"
 _CODEX_WIRE_DEBUG_DIR = "codex_wire"
+_EXPLORE_REDUCER_DEBUG_DIR = "explore_reducer"
 _BIN_DIR = "bin"
 _PROXY_CLIENTS_DIR = "clients"
 _DEPLOY_DIR = "deploy"
@@ -318,6 +319,12 @@ def codex_wire_debug_dir() -> Path:
     return log_dir() / _CODEX_WIRE_DEBUG_DIR
 
 
+def explore_reducer_debug_dir() -> Path:
+    """Return the directory used for opt-in explore ContextReducer debug captures."""
+
+    return log_dir() / _EXPLORE_REDUCER_DEBUG_DIR
+
+
 def bin_dir() -> Path:
     """Return the directory where Headroom ships vendored binaries."""
 
@@ -434,6 +441,7 @@ __all__ = [
     "proxy_log_path",
     "debug_400_dir",
     "codex_wire_debug_dir",
+    "explore_reducer_debug_dir",
     "bin_dir",
     "proxy_clients_dir",
     "deploy_root",

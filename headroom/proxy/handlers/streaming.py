@@ -1478,6 +1478,25 @@ class StreamingMixin:
             or k.lower() in ("request-id", "anthropic-request-id", "x-request-id")
         }
 
+        from headroom.proxy.explore_pruner.stream_rewrite import (
+            ExploreStreamRewriter,
+            pop_complete_sse_event,
+            resolve_explore_session_key,
+            rewrite_sse_event_bytes,
+        )
+
+        explore_svc = getattr(self, "explore_tool_service", None)
+        explore_rewriter: ExploreStreamRewriter | None = None
+        if explore_svc is not None and provider == "openai" and "/responses" in url:
+            explore_rewriter = ExploreStreamRewriter(
+                explore_svc,
+                session_key=resolve_explore_session_key(
+                    headers=headers,
+                    body=body if isinstance(body, dict) else None,
+                    request_id=request_id,
+                ),
+            )
+
         async def generate():
             nonlocal body, memory_enabled  # May need to modify for continuation requests
 
@@ -1492,6 +1511,7 @@ class StreamingMixin:
             parsed_response = None  # Set by memory block; used by CCR + prefix tracker
             completed_normally = False
             pending_messages: list[dict] = []
+            explore_sse_buf = bytearray()
 
             try:
                 async with contextlib.aclosing(upstream_response) as response:
@@ -1522,9 +1542,25 @@ class StreamingMixin:
                             tail = bytes(stream_state["sse_buffer"][-MAX_SSE_BUFFER_SIZE // 2 :])
                             stream_state["sse_buffer"] = bytearray(tail)
 
-                        # Always stream immediately — buffering breaks
-                        # real-time clients (LangGraph, LangChain, etc.)
-                        yield chunk
+                        if explore_rewriter is not None:
+                            explore_sse_buf.extend(chunk)
+                            if len(explore_sse_buf) > MAX_SSE_BUFFER_SIZE:
+                                tail = bytes(explore_sse_buf[-MAX_SSE_BUFFER_SIZE // 2 :])
+                                explore_sse_buf[:] = tail
+                            while True:
+                                raw_event = pop_complete_sse_event(explore_sse_buf)
+                                if raw_event is None:
+                                    break
+                                rewritten = rewrite_sse_event_bytes(
+                                    raw_event, explore_rewriter
+                                )
+                                if rewritten is None:
+                                    continue
+                                yield rewritten
+                        else:
+                            # Always stream immediately — buffering breaks
+                            # real-time clients (LangGraph, LangChain, etc.)
+                            yield chunk
 
                         if _codex_wire_debug:
                             capture_codex_wire_debug(
@@ -1581,6 +1617,15 @@ class StreamingMixin:
                                 stream_state["cache_creation_ephemeral_1h_input_tokens"] = usage[
                                     "cache_creation_ephemeral_1h_input_tokens"
                                 ]
+
+                if explore_rewriter is not None and explore_sse_buf:
+                    leftover = bytes(explore_sse_buf)
+                    if not leftover.endswith(b"\n\n") and not leftover.endswith(b"\r\n\r\n"):
+                        leftover += b"\n\n"
+                    rewritten = rewrite_sse_event_bytes(leftover, explore_rewriter)
+                    if rewritten is not None:
+                        yield rewritten
+                    explore_sse_buf.clear()
 
                 # Memory tool handling after stream completes
                 # Chunks were already yielded in real-time above, so we only

@@ -1228,6 +1228,26 @@ class HeadroomProxy(
             else None
         )
 
+        # Explore-tool + context reducer (OpenAI Responses). Opt-in via config/env.
+        self.explore_tool_service = None
+        try:
+            from headroom.proxy.explore_pruner.factory import (
+                build_explore_tool_service,
+                explore_pruner_config_from_env,
+            )
+
+            explore_cfg = explore_pruner_config_from_env(config.explore_pruner)
+            self.config.explore_pruner = explore_cfg
+            self.explore_tool_service = build_explore_tool_service(explore_cfg)
+            if self.explore_tool_service is not None:
+                logger.info(
+                    "Explore pruner: ENABLED (reducer=%s)",
+                    explore_cfg.reducer,
+                )
+        except Exception:
+            logger.exception("Explore pruner init failed; continuing without it")
+            self.explore_tool_service = None
+
         # Turn counter for context tracking
         self._turn_counter = 0
 
@@ -5287,7 +5307,14 @@ def _proxy_config_from_env() -> ProxyConfig:
             os.environ.get("HEADROOM_MODEL_ROUTER_ENABLED"),
             os.environ.get("HEADROOM_MODEL_ROUTES"),
         ),
+        explore_pruner=_explore_pruner_config_from_env(),
     )
+
+
+def _explore_pruner_config_from_env():
+    from headroom.proxy.explore_pruner.factory import explore_pruner_config_from_env
+
+    return explore_pruner_config_from_env()
 
 
 def create_app_from_env() -> FastAPI:

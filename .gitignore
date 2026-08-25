@@ -269,3 +269,4 @@ uv.lock
 .tokensave
 
 .codebase-memory/
+test_dir/*

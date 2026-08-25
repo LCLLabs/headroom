@@ -385,6 +385,38 @@ def _resolve_openai_upstream_base(request_headers: dict[str, str]) -> str | None
     return normalized
 
 
+def _ensure_openai_authorization_header(
+    headers: dict[str, str],
+    *,
+    request_id: str,
+    source: str,
+) -> dict[str, str]:
+    """If the client omitted Authorization, fall back to OPENAI_API_KEY.
+
+    Codex HTTP /v1/responses clients sometimes send no auth header when the
+    API key lives only in the proxy environment. The WS upgrade path already
+    had this safety net; HTTP forwarding must match it.
+    """
+    if any(k.lower() == "authorization" for k in headers):
+        return headers
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+        logger.debug(
+            "[%s] %s: injected Authorization from OPENAI_API_KEY env",
+            request_id,
+            source,
+        )
+    else:
+        logger.warning(
+            "[%s] %s: no Authorization header from client and "
+            "OPENAI_API_KEY not set — upstream will likely reject",
+            request_id,
+            source,
+        )
+    return headers
+
+
 def _resolve_openai_chat_handler_path(base_url: str, model: str | None) -> str:
     """Return the upstream path suffix for an OpenAI chat-completions request."""
 
@@ -1024,6 +1056,76 @@ def _responses_input_to_items(input_data: Any) -> list[dict[str, Any]]:
     if isinstance(input_data, str) and input_data:
         return [{"role": "user", "content": input_data}]
     return []
+
+
+def _explore_session_key(
+    *,
+    headers: Any,
+    body: dict[str, Any] | None,
+    request_id: str,
+) -> str:
+    """Resolve a stable session key for explore prune store lookups."""
+    from headroom.proxy.explore_pruner.stream_rewrite import resolve_explore_session_key
+
+    return resolve_explore_session_key(
+        headers=headers, body=body, request_id=request_id
+    )
+
+
+async def _explore_prepare_and_prune(
+    service: Any,
+    body: dict[str, Any],
+    *,
+    session_key: str,
+    request_id: str,
+) -> None:
+    """Inject explore tool + prune inbound function_call_output items."""
+    if service is None or not isinstance(body, dict):
+        return
+    try:
+        service.prepare_request(body)
+        changed = await service.prune_inbound(body, session_key=session_key)
+        if changed:
+            logger.info("[%s] explore_pruner inbound pruned session=%s", request_id, session_key)
+    except Exception:
+        logger.exception("[%s] explore_pruner prepare/prune failed", request_id)
+
+
+def _explore_rewrite_output(
+    service: Any,
+    output_items: Any,
+    *,
+    session_key: str,
+) -> list[Any] | Any:
+    """Rewrite explore_source_code items to exec_command(sed)."""
+    if service is None or not isinstance(output_items, list):
+        return output_items
+    try:
+        return service.rewrite_outbound_items(output_items, session_key=session_key)
+    except Exception:
+        logger.exception("explore_pruner outbound rewrite failed")
+        return output_items
+
+
+def _strip_explore_pruned_marker_from_frame(raw: str) -> str:
+    """Remove internal explore pruned-call-id marker from a WS frame JSON string."""
+    from headroom.proxy.explore_pruner.focus import PRUNED_CALL_IDS_KEY
+
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return raw
+    if not isinstance(parsed, dict):
+        return raw
+    changed = False
+    if PRUNED_CALL_IDS_KEY in parsed:
+        parsed.pop(PRUNED_CALL_IDS_KEY, None)
+        changed = True
+    inner = parsed.get("response")
+    if isinstance(inner, dict) and PRUNED_CALL_IDS_KEY in inner:
+        inner.pop(PRUNED_CALL_IDS_KEY, None)
+        changed = True
+    return json.dumps(parsed) if changed else raw
 
 
 def _responses_stateless_output_items(output_items: Any) -> list[dict[str, Any]]:
@@ -1931,6 +2033,14 @@ class OpenAIHandlerMixin:
             if is_tool_excluded(fn_name, DEFAULT_VERBATIM_EXCLUDE_TOOLS)
         }
 
+        # Explore-pruner already rewrote these outputs; skip ContentRouter.
+        from headroom.proxy.explore_pruner.focus import PRUNED_CALL_IDS_KEY
+
+        explore_pruned_raw = payload.get(PRUNED_CALL_IDS_KEY)
+        explore_pruned_call_ids: set[str] = set()
+        if isinstance(explore_pruned_raw, (set, list, tuple, frozenset)):
+            explore_pruned_call_ids = {str(x) for x in explore_pruned_raw}
+
         timing_sink: dict[str, float] = timing if timing is not None else {}
 
         def _add_timing(name: str, started_at: float) -> None:
@@ -1961,6 +2071,19 @@ class OpenAIHandlerMixin:
             item_type = item.get("type")
             if item_type in self.OPENAI_RESPONSES_OUTPUT_TYPES:
                 call_id = item.get("call_id")
+                if isinstance(call_id, str) and call_id in explore_pruned_call_ids:
+                    if debug_enabled:
+                        extraction_debug.append(
+                            {
+                                "index": idx,
+                                "eligible": False,
+                                "reason": "explore_pruner_already_pruned",
+                                "item_type": item_type,
+                                "call_id": call_id,
+                                "item": item,
+                            }
+                        )
+                    continue
                 if isinstance(call_id, str) and call_id in headroom_retrieve_call_ids:
                     if debug_enabled:
                         extraction_debug.append(
@@ -5147,6 +5270,9 @@ class OpenAIHandlerMixin:
             request_id=request_id,
         )
         headers, is_chatgpt_auth = _resolve_codex_routing_headers(headers)
+        headers = _ensure_openai_authorization_header(
+            headers, request_id=request_id, source="openai_responses"
+        )
         if is_chatgpt_auth:
             client = "codex"
         if _ensure_chatgpt_responses_store_false(body, is_chatgpt_auth=is_chatgpt_auth):
@@ -5450,6 +5576,23 @@ class OpenAIHandlerMixin:
         # CompressionUnits and routing them through ContentRouter. Policy
         # gating already happened upstream (auth_mode classify,
         # CompressionPolicy resolve at request entry).
+        from headroom.proxy.explore_pruner.focus import PRUNED_CALL_IDS_KEY
+
+        explore_svc = getattr(self, "explore_tool_service", None)
+        explore_session = _explore_session_key(
+            headers=request.headers,
+            body=body if isinstance(body, dict) else None,
+            request_id=request_id,
+        )
+        if explore_svc is not None and not _bypass:
+            await _explore_prepare_and_prune(
+                explore_svc,
+                body,
+                session_key=explore_session,
+                request_id=request_id,
+            )
+            body_mutation_tracker.mark_mutated("explore_pruner")
+
         if self.config.optimize and not _bypass:
             try:
                 (
@@ -5572,6 +5715,9 @@ class OpenAIHandlerMixin:
                     request_id,
                     _shape_result.labels,
                 )
+
+            # Internal-only marker for ContentRouter skip; never forward upstream.
+            body.pop(PRUNED_CALL_IDS_KEY, None)
 
             capture_codex_wire_debug(
                 "http_upstream_request",
@@ -6142,6 +6288,30 @@ class OpenAIHandlerMixin:
 
                     get_codex_rate_limit_state().update_from_headers(dict(response.headers))
 
+                    # Explore outbound: rewrite explore_source_code → sed before client.
+                    if (
+                        explore_svc is not None
+                        and resp_json
+                        and response.status_code == 200
+                        and isinstance(resp_json.get("output"), list)
+                    ):
+                        rewritten = _explore_rewrite_output(
+                            explore_svc,
+                            resp_json["output"],
+                            session_key=explore_session,
+                        )
+                        if rewritten is not resp_json["output"]:
+                            resp_json = {**resp_json, "output": rewritten}
+                            response = httpx.Response(
+                                status_code=response.status_code,
+                                content=json.dumps(resp_json).encode(),
+                                headers={
+                                    k: v
+                                    for k, v in response.headers.items()
+                                    if k.lower() not in ("content-encoding", "content-length")
+                                },
+                            )
+
                     # Remove compression headers
                     response_headers = _sanitize_forwarded_response_headers(response.headers)
 
@@ -6466,16 +6636,9 @@ class OpenAIHandlerMixin:
         # Resolved AFTER apply_copilot_api_auth (moved earlier, see below) so a
         # real client-supplied Copilot credential is never mistaken for, or
         # clobbered by, this unrelated OpenAI-key fallback.
-        if not any(k.lower() == "authorization" for k in upstream_headers):
-            api_key = os.environ.get("OPENAI_API_KEY")
-            if api_key:
-                upstream_headers["Authorization"] = f"Bearer {api_key}"
-                logger.debug(f"[{request_id}] WS: injected Authorization from OPENAI_API_KEY env")
-            else:
-                logger.warning(
-                    f"[{request_id}] WS: no Authorization header from client and "
-                    f"OPENAI_API_KEY not set — upstream will likely reject"
-                )
+        upstream_headers = _ensure_openai_authorization_header(
+            upstream_headers, request_id=request_id, source="WS"
+        )
 
         # Ensure the required beta header is present — OpenAI returns 500 without it.
         # PR-A6 (P5-50): use the deterministic `merge_openai_beta` helper
@@ -7224,6 +7387,43 @@ class OpenAIHandlerMixin:
             # internal errors), but we wrap the call site in try/except
             # anyway so a JSON-shape edge case can never break the WS
             # session.
+            # Explore-tool: inject + prune on the first response.create before
+            # ContentRouter, even when optimize is off.
+            ws_explore_session = request_id
+            _explore_svc_ws = getattr(self, "explore_tool_service", None)
+            _ws_explore_rewriter = None
+            if _explore_svc_ws is not None and not _ws_bypass:
+                try:
+                    _explore_body = json.loads(first_msg_raw)
+                except json.JSONDecodeError:
+                    _explore_body = None
+                if isinstance(_explore_body, dict):
+                    _ew = "response" in _explore_body and isinstance(
+                        _explore_body["response"], dict
+                    )
+                    _ei = _explore_body["response"] if _ew else _explore_body
+                    if isinstance(_ei, dict):
+                        ws_explore_session = _explore_session_key(
+                            headers=websocket.headers,
+                            body=_ei,
+                            request_id=request_id,
+                        )
+                        await _explore_prepare_and_prune(
+                            _explore_svc_ws,
+                            _ei,
+                            session_key=ws_explore_session,
+                            request_id=request_id,
+                        )
+                        # Re-serialize with pruned ids still present for compression.
+                        first_msg_raw = json.dumps(_explore_body)
+
+            if _explore_svc_ws is not None and not _ws_bypass:
+                from headroom.proxy.explore_pruner.stream_rewrite import ExploreStreamRewriter
+
+                _ws_explore_rewriter = ExploreStreamRewriter(
+                    _explore_svc_ws, session_key=ws_explore_session
+                )
+
             first_frame_rewritten = False
             if self.config.optimize and not _ws_bypass:
                 _first_frame_compression_elapsed_ms = 0.0
@@ -7458,6 +7658,7 @@ class OpenAIHandlerMixin:
                         _shape_labels,
                     )
 
+            first_msg_raw = _strip_explore_pruned_marker_from_frame(first_msg_raw)
             first_msg_raw = _normalize_ws_response_create_for_upstream(first_msg_raw)
             try:
                 final_first_body = json.loads(first_msg_raw)
@@ -7528,7 +7729,7 @@ class OpenAIHandlerMixin:
                         frames in the WS session.
                         """
                         nonlocal tokens_saved, transforms_applied, attempted_input_tokens_total
-                        nonlocal ws_frames_compressed
+                        nonlocal ws_frames_compressed, ws_explore_session
                         _preflight_started = time.perf_counter()
                         try:
                             parsed_frame = json.loads(raw_msg)
@@ -7585,6 +7786,25 @@ class OpenAIHandlerMixin:
                                 request_id,
                                 frame_index,
                             )
+
+                        # Explore prepare/prune on every response.create turn.
+                        _explore_svc_frame = getattr(self, "explore_tool_service", None)
+                        if _explore_svc_frame is not None and not _ws_bypass:
+                            ws_explore_session = _explore_session_key(
+                                headers=websocket.headers,
+                                body=inner_payload,
+                                request_id=request_id,
+                            )
+                            if _ws_explore_rewriter is not None:
+                                _ws_explore_rewriter.set_session_key(ws_explore_session)
+                            await _explore_prepare_and_prune(
+                                _explore_svc_frame,
+                                inner_payload,
+                                session_key=ws_explore_session,
+                                request_id=request_id,
+                            )
+                            raw_after_store = json.dumps(parsed_frame)
+
                         if _ws_bypass:
                             _log_ws_passthrough(
                                 "bypass_header",
@@ -7594,7 +7814,7 @@ class OpenAIHandlerMixin:
                                 model=str(inner_payload.get("model") or "unknown"),
                             )
                             return (
-                                raw_after_store,
+                                _strip_explore_pruned_marker_from_frame(raw_after_store),
                                 store_forced,
                                 "chatgpt_store_false" if store_forced else "bypass_header",
                             )
@@ -7607,7 +7827,7 @@ class OpenAIHandlerMixin:
                                 model=str(inner_payload.get("model") or "unknown"),
                             )
                             return (
-                                raw_after_store,
+                                _strip_explore_pruned_marker_from_frame(raw_after_store),
                                 store_forced,
                                 "chatgpt_store_false" if store_forced else "optimize_disabled",
                             )
@@ -7732,7 +7952,7 @@ class OpenAIHandlerMixin:
                                 model=str(inner_payload.get("model") or "unknown"),
                             )
                             return (
-                                raw_after_store,
+                                _strip_explore_pruned_marker_from_frame(raw_after_store),
                                 store_forced,
                                 "chatgpt_store_false" if store_forced else "compression_exception",
                             )
@@ -7753,7 +7973,7 @@ class OpenAIHandlerMixin:
                                 model=str(inner_payload.get("model") or "unknown"),
                             )
                             return (
-                                raw_after_store,
+                                _strip_explore_pruned_marker_from_frame(raw_after_store),
                                 store_forced,
                                 "chatgpt_store_false" if store_forced else reason,
                             )
@@ -7766,7 +7986,7 @@ class OpenAIHandlerMixin:
                                 model=str(inner_payload.get("model") or "unknown"),
                             )
                             return (
-                                raw_after_store,
+                                _strip_explore_pruned_marker_from_frame(raw_after_store),
                                 store_forced,
                                 "chatgpt_store_false"
                                 if store_forced
@@ -7803,7 +8023,11 @@ class OpenAIHandlerMixin:
                             _frame_auth_mode.value,
                             ws_frames_compressed,
                         )
-                        return rewritten, True, frame_reason or "compressed"
+                        return (
+                            _strip_explore_pruned_marker_from_frame(rewritten),
+                            True,
+                            frame_reason or "compressed",
+                        )
 
                     async def _client_to_upstream() -> None:
                         nonlocal client_relay_error, ws_response_create_frames
@@ -8250,6 +8474,17 @@ class OpenAIHandlerMixin:
                                     upstream_frame_index,
                                     ws_last_upstream_frame_type,
                                 )
+
+                                # Explore outbound rewrite so Codex never sees
+                                # explore_source_code (unknown to the harness).
+                                if _ws_explore_rewriter is not None:
+                                    rewritten_event = _ws_explore_rewriter.rewrite_event(event)
+                                    if rewritten_event is None:
+                                        continue
+                                    if rewritten_event is not event:
+                                        event = rewritten_event
+                                        msg_str = json.dumps(event)
+
                                 response = event.get("response")
                                 completed_response_model = (
                                     str(response.get("model") or "unknown")
@@ -8938,6 +9173,31 @@ class OpenAIHandlerMixin:
         ):
             mutation_reasons.append("chatgpt_store_false")
 
+        fallback_rewriter = None
+        _rewrite_fallback_line = None
+        _explore_svc_fb = getattr(self, "explore_tool_service", None)
+        if _explore_svc_fb is not None:
+            from headroom.proxy.explore_pruner.stream_rewrite import (
+                ExploreStreamRewriter,
+                resolve_explore_session_key,
+                rewrite_explore_sse_data_line,
+            )
+
+            fallback_rewriter = ExploreStreamRewriter(
+                _explore_svc_fb,
+                session_key=resolve_explore_session_key(
+                    headers=upstream_headers,
+                    body=http_body,
+                    request_id=request_id,
+                ),
+            )
+            _rewrite_fallback_line = rewrite_explore_sse_data_line
+
+        def _rewrite_fallback_data(data_str: str) -> str | None:
+            if fallback_rewriter is None or _rewrite_fallback_line is None:
+                return data_str
+            return _rewrite_fallback_line(data_str, fallback_rewriter)
+
         # Build HTTP headers from the upstream headers (already stripped of WS
         # hop-by-hop headers by the caller).
         http_headers = dict(upstream_headers)
@@ -9027,9 +9287,12 @@ class OpenAIHandlerMixin:
                                     data = line[6:]
                                     if data == "[DONE]":
                                         continue
-                                    _accumulate_usage(data)
+                                    rewritten_data = _rewrite_fallback_data(data)
+                                    if rewritten_data is None:
+                                        continue
+                                    _accumulate_usage(rewritten_data)
                                     try:
-                                        await websocket.send_text(data)
+                                        await websocket.send_text(rewritten_data)
                                     except Exception:
                                         return tuple(fallback_usage)  # type: ignore[return-value]
                                 elif line.startswith("event: "):
@@ -9040,9 +9303,12 @@ class OpenAIHandlerMixin:
                         for line in buffer.strip().splitlines():
                             line = line.strip()
                             if line.startswith("data: ") and line[6:] != "[DONE]":
-                                _accumulate_usage(line[6:])
+                                rewritten_data = _rewrite_fallback_data(line[6:])
+                                if rewritten_data is None:
+                                    continue
+                                _accumulate_usage(rewritten_data)
                                 with contextlib.suppress(Exception):
-                                    await websocket.send_text(line[6:])
+                                    await websocket.send_text(rewritten_data)
                         return tuple(fallback_usage)  # type: ignore[return-value]
                 except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout) as http_err:
                     if http_attempt >= retry_attempts - 1:

@@ -867,6 +867,45 @@ def test_codex_responses_timeout_fails_open_in_standalone_proxy(monkeypatch):
     assert body["input"][0]["output"] == "large tool output"
 
 
+def test_handle_openai_responses_injects_openai_api_key_when_authorization_missing(
+    monkeypatch,
+):
+    """HTTP /v1/responses must fall back to OPENAI_API_KEY like the WS path."""
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-env-fallback")
+    request = _build_request(
+        {"model": "gpt-5.4", "input": "hello"},
+        {"originator": "codex-tui"},
+    )
+    handler = _DummyOpenAIHandler()
+    monkeypatch.setattr("headroom.tokenizers.get_tokenizer", lambda model: _DummyTokenizer())
+
+    response = anyio.run(handler.handle_openai_responses, request)
+
+    assert response.status_code == 200
+    assert handler.captured_request is not None
+    _, _, headers, _ = handler.captured_request
+    auth = next((v for k, v in headers.items() if k.lower() == "authorization"), None)
+    assert auth == "Bearer sk-env-fallback"
+
+
+def test_handle_openai_responses_preserves_client_authorization(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-env-fallback")
+    request = _build_request(
+        {"model": "gpt-5.4", "input": "hello"},
+        {"Authorization": "Bearer sk-from-client"},
+    )
+    handler = _DummyOpenAIHandler()
+    monkeypatch.setattr("headroom.tokenizers.get_tokenizer", lambda model: _DummyTokenizer())
+
+    response = anyio.run(handler.handle_openai_responses, request)
+
+    assert response.status_code == 200
+    assert handler.captured_request is not None
+    _, _, headers, _ = handler.captured_request
+    auth = next((v for k, v in headers.items() if k.lower() == "authorization"), None)
+    assert auth == "Bearer sk-from-client"
+
+
 class _DummyWebSocket:
     def __init__(self, headers: dict[str, str]):
         self.headers = headers

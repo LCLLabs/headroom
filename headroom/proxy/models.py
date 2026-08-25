@@ -134,6 +134,29 @@ class RateLimitState:
 
 
 @dataclass
+class ExplorePrunerConfig:
+    """Explore-tool + pluggable context reducer (OpenAI Responses path)."""
+
+    enabled: bool = False
+    reducer: str = "swe_pruner"
+    min_chars_to_prune: int = 1000
+    focus_max_chars: int = 500
+    explore_max_lines: int = 400
+    api_base: str = "http://127.0.0.1:8080"
+    api_key: str | None = None
+    timeout_seconds: float = 60.0
+    threshold: float | None = None
+    always_keep_first_frags: bool | None = None
+    chunk_overlap_tokens: int | None = None
+    ast_protect_enabled: bool = True  # swe_pruner only; ignored by other reducers
+    rebuild_fallback: str = "pruned"
+    fail_open: bool = True
+    instructions_enabled: bool = True
+    store_ttl_seconds: int = 900
+    store_max_entries: int = 10_000
+
+
+@dataclass
 class ProxyConfig:
     """Proxy configuration."""
 
@@ -187,6 +210,11 @@ class ProxyConfig:
     # when configured, an ordered rule set can rewrite the outgoing model based
     # on request size / tool presence. None keeps behavior unchanged.
     model_router: ModelRouterConfig | None = None
+
+    # Explore-tool pruner (OpenAI Responses). Opt-in; default off.
+    # Env: HEADROOM_EXPLORE_PRUNER_ENABLED, HEADROOM_EXPLORE_REDUCER,
+    # HEADROOM_PRUNER_API_BASE / HEADROOM_PRUNER_API_KEY.
+    explore_pruner: ExplorePrunerConfig = field(default_factory=ExplorePrunerConfig)
 
     # CCR Tool Injection
     ccr_inject_tool: bool = True
@@ -528,6 +556,9 @@ class ProxyConfig:
     def __post_init__(self, smart_routing: bool | None = None) -> None:
         if self.rollout is None:
             self.rollout = resolve_rollout()
+        # Multi-worker JSON round-trip may restore nested configs as plain dicts.
+        if isinstance(self.explore_pruner, dict):
+            self.explore_pruner = ExplorePrunerConfig(**self.explore_pruner)
         # ``read_maturation`` remains a concrete, already-resolved runtime
         # setting for programmatic/config-file callers.  The CLI composition
         # root derives it from this same snapshot before constructing the
