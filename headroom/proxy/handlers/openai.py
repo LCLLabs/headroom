@@ -1263,17 +1263,46 @@ async def _explore_prepare_and_prune(
     *,
     session_key: str,
     request_id: str,
-) -> None:
-    """Inject explore tool + prune inbound function_call_output items."""
+    count_text: Any = None,
+) -> Any:
+    """Inject explore tool + prune inbound function_call_output items.
+
+    Returns a :class:`~headroom.proxy.explore_pruner.types.PruneSavings` report
+    so callers can fold the token delta into the request funnel. Fail-open:
+    exceptions are logged and an empty report is returned.
+    """
+    from headroom.proxy.explore_pruner.types import PruneSavings
+
+    empty = PruneSavings()
     if service is None or not isinstance(body, dict):
-        return
+        return empty
     try:
         service.prepare_request(body)
-        changed = await service.prune_inbound(body, session_key=session_key)
-        if changed:
-            logger.info("[%s] explore_pruner inbound pruned session=%s", request_id, session_key)
+        report = await service.prune_inbound(
+            body, session_key=session_key, count_text=count_text
+        )
+        if report.changed:
+            logger.info(
+                "[%s] explore_pruner inbound pruned session=%s tokens_saved=%d",
+                request_id,
+                session_key,
+                report.tokens_saved,
+            )
+        return report
     except Exception:
         logger.exception("[%s] explore_pruner prepare/prune failed", request_id)
+        return empty
+
+
+def _explore_count_text(handler: Any, model: str) -> Any:
+    """Return the OpenAI tokenizer's ``count_text``, or None if unavailable."""
+    try:
+        provider = getattr(handler, "openai_provider", None)
+        if provider is None:
+            return None
+        return provider.get_token_counter(str(model or "")).count_text
+    except Exception:
+        return None
 
 
 def _explore_rewrite_output(
@@ -5819,6 +5848,8 @@ class OpenAIHandlerMixin:
         # gating already happened upstream (auth_mode classify,
         # CompressionPolicy resolve at request entry).
         from headroom.proxy.explore_pruner.focus import PRUNED_CALL_IDS_KEY
+        from headroom.proxy.explore_pruner.savings import apply_explore_prune_savings
+        from headroom.proxy.explore_pruner.types import PruneSavings
 
         explore_svc = getattr(self, "explore_tool_service", None)
         explore_session = _explore_session_key(
@@ -5826,12 +5857,14 @@ class OpenAIHandlerMixin:
             body=body if isinstance(body, dict) else None,
             request_id=request_id,
         )
+        explore_report = PruneSavings()
         if explore_svc is not None and not _bypass:
-            await _explore_prepare_and_prune(
+            explore_report = await _explore_prepare_and_prune(
                 explore_svc,
                 body,
                 session_key=explore_session,
                 request_id=request_id,
+                count_text=_explore_count_text(self, model),
             )
             body_mutation_tracker.mark_mutated("explore_pruner")
 
@@ -5931,6 +5964,18 @@ class OpenAIHandlerMixin:
                             }
                         },
                     ) from _e
+
+        tokens_saved, attempted_input_tokens, original_tokens = apply_explore_prune_savings(
+            explore_report,
+            tokens_saved=tokens_saved,
+            attempted_input_tokens=attempted_input_tokens,
+            original_tokens=original_tokens,
+            transforms=transforms_applied,
+            tags=tags,
+            metrics=getattr(self, "metrics", None),
+        )
+        if explore_report.tokens_before > 0:
+            optimized_tokens = max(0, original_tokens - tokens_saved)
 
         if not _bypass:
             _http_conversation_key = request.headers.get("x-headroom-session-id")
@@ -7214,6 +7259,10 @@ class OpenAIHandlerMixin:
             attempted_input_tokens_total = 0
             transforms_applied: list[str] = []
             ws_frames_compressed = 0
+            # Per-turn prune attribution; merged into the next RequestOutcome
+            # then cleared so a long-lived WS session cannot replay the same
+            # explore_pruner row into by_source on every subsequent turn.
+            ws_prune_tags: dict[str, Any] = {}
             try:
                 body = json.loads(first_msg_raw)
             except json.JSONDecodeError:
@@ -7626,9 +7675,17 @@ class OpenAIHandlerMixin:
             # session.
             # Explore-tool: inject + prune on the first response.create before
             # ContentRouter, even when optimize is off.
+            from headroom.proxy.explore_pruner.savings import (
+                apply_explore_prune_savings,
+                attach_explore_prune_tags,
+                merge_explore_prune_attribution,
+            )
+            from headroom.proxy.explore_pruner.types import PruneSavings as _WsPruneSavings
+
             ws_explore_session = request_id
             _explore_svc_ws = getattr(self, "explore_tool_service", None)
             _ws_explore_rewriter = None
+            _first_prune = _WsPruneSavings()
             if _explore_svc_ws is not None and not _ws_bypass:
                 try:
                     _explore_body = json.loads(first_msg_raw)
@@ -7645,12 +7702,24 @@ class OpenAIHandlerMixin:
                             body=_ei,
                             request_id=request_id,
                         )
-                        await _explore_prepare_and_prune(
+                        _first_prune = await _explore_prepare_and_prune(
                             _explore_svc_ws,
                             _ei,
                             session_key=ws_explore_session,
                             request_id=request_id,
+                            count_text=_explore_count_text(self, str(_ei.get("model") or "")),
                         )
+                        _prune_tags: dict[str, Any] = {}
+                        tokens_saved, attempted_input_tokens_total, _ = apply_explore_prune_savings(
+                            _first_prune,
+                            tokens_saved=tokens_saved,
+                            attempted_input_tokens=attempted_input_tokens_total,
+                            original_tokens=0,
+                            transforms=transforms_applied,
+                            tags=_prune_tags,
+                            metrics=getattr(self, "metrics", None),
+                        )
+                        merge_explore_prune_attribution(ws_prune_tags, _prune_tags)
                         # Re-serialize with pruned ids still present for compression.
                         first_msg_raw = json.dumps(_explore_body)
 
@@ -7725,9 +7794,10 @@ class OpenAIHandlerMixin:
                                 elapsed_ms=_first_frame_compression_elapsed_ms,
                                 bytes_before=_bytes_before,
                                 bytes_after=_bytes_after,
-                                attempted_tokens=_ws_attempted_tokens,
-                                tokens_saved=_ws_saved,
-                                modified=_modified,
+                                attempted_tokens=int(_ws_attempted_tokens)
+                                + _first_prune.tokens_before,
+                                tokens_saved=int(_ws_saved) + _first_prune.tokens_saved,
+                                modified=_modified or _first_prune.changed,
                                 strategy_chain=_codex_ws_strategy_chain(_ws_transforms),
                                 final_strategies=_codex_ws_final_strategies(_ws_compression_timing),
                             )
@@ -7966,7 +8036,12 @@ class OpenAIHandlerMixin:
                         frames in the WS session.
                         """
                         nonlocal tokens_saved, transforms_applied, attempted_input_tokens_total
-                        nonlocal ws_frames_compressed, ws_explore_session
+                        nonlocal ws_frames_compressed, ws_explore_session, ws_prune_tags
+                        from headroom.proxy.explore_pruner.types import (
+                            PruneSavings as _FramePruneSavings,
+                        )
+
+                        _frame_prune = _FramePruneSavings()
                         _preflight_started = time.perf_counter()
                         try:
                             parsed_frame = json.loads(raw_msg)
@@ -8026,6 +8101,7 @@ class OpenAIHandlerMixin:
 
                         # Explore prepare/prune on every response.create turn.
                         _explore_svc_frame = getattr(self, "explore_tool_service", None)
+                        _frame_prune = _WsPruneSavings()
                         if _explore_svc_frame is not None and not _ws_bypass:
                             ws_explore_session = _explore_session_key(
                                 headers=websocket.headers,
@@ -8034,12 +8110,29 @@ class OpenAIHandlerMixin:
                             )
                             if _ws_explore_rewriter is not None:
                                 _ws_explore_rewriter.set_session_key(ws_explore_session)
-                            await _explore_prepare_and_prune(
+
+                            _frame_prune = await _explore_prepare_and_prune(
                                 _explore_svc_frame,
                                 inner_payload,
                                 session_key=ws_explore_session,
                                 request_id=request_id,
+                                count_text=_explore_count_text(
+                                    self, str(inner_payload.get("model") or "")
+                                ),
                             )
+                            _frame_prune_tags: dict[str, Any] = {}
+                            tokens_saved, attempted_input_tokens_total, _ = (
+                                apply_explore_prune_savings(
+                                    _frame_prune,
+                                    tokens_saved=tokens_saved,
+                                    attempted_input_tokens=attempted_input_tokens_total,
+                                    original_tokens=0,
+                                    transforms=transforms_applied,
+                                    tags=_frame_prune_tags,
+                                    metrics=getattr(self, "metrics", None),
+                                )
+                            )
+                            merge_explore_prune_attribution(ws_prune_tags, _frame_prune_tags)
                             raw_after_store = json.dumps(parsed_frame)
 
                         if _ws_bypass:
@@ -8153,9 +8246,10 @@ class OpenAIHandlerMixin:
                                     elapsed_ms=frame_compression_elapsed_ms,
                                     bytes_before=bytes_before,
                                     bytes_after=bytes_after,
-                                    attempted_tokens=frame_attempted_tokens,
-                                    tokens_saved=frame_saved,
-                                    modified=modified,
+                                    attempted_tokens=int(frame_attempted_tokens)
+                                    + _frame_prune.tokens_before,
+                                    tokens_saved=int(frame_saved) + _frame_prune.tokens_saved,
+                                    modified=modified or _frame_prune.changed,
                                     strategy_chain=_codex_ws_strategy_chain(frame_transforms),
                                     final_strategies=_codex_ws_final_strategies(
                                         frame_compression_timing
@@ -8513,6 +8607,7 @@ class OpenAIHandlerMixin:
                             nonlocal ws_recorded_tokens_saved_total
                             nonlocal ws_recorded_attempted_input_tokens_total
                             nonlocal ws_recorded_overhead_ms_total, ws_recorded_ttfb_ms
+                            nonlocal ws_prune_tags
 
                             input_delta = ws_input_tokens_total - ws_recorded_input_tokens_total
                             output_delta = ws_output_tokens_total - ws_recorded_output_tokens_total
@@ -8578,7 +8673,16 @@ class OpenAIHandlerMixin:
                             # `x-headroom-tag-*` headers extracted
                             # at the WS upgrade) so dashboards can
                             # slice WS turns by tag — same surface
-                            # as HTTP turns.
+                            # as HTTP turns. Prune attribution is merged
+                            # only when this turn actually records savings
+                            # so a usage-less cancel cannot park
+                            # explore_pruner rows on a 0-saved outcome.
+                            _ws_outcome_tags = dict(ws_tags) if ws_tags else {}
+                            if saved_delta > 0:
+                                _ws_outcome_tags = attach_explore_prune_tags(
+                                    _ws_outcome_tags, ws_prune_tags
+                                )
+                                ws_prune_tags.clear()
                             await self._record_request_outcome(
                                 RequestOutcome(
                                     # Per-emission ids keep dashboard request-log keys unique.
@@ -8606,7 +8710,7 @@ class OpenAIHandlerMixin:
                                     )
                                     if isinstance(body, dict)
                                     else 0,
-                                    tags=ws_tags,
+                                    tags=_ws_outcome_tags,
                                     client=client,
                                 )
                             )
@@ -9170,6 +9274,8 @@ class OpenAIHandlerMixin:
                 "cache_write_tokens": str(ws_cache_write_tokens_total),
                 "uncached_input_tokens": str(ws_uncached_input_tokens_total),
             }
+            ws_session_tags = attach_explore_prune_tags(ws_session_tags, ws_prune_tags)
+            ws_prune_tags.clear()
             if (
                 residual_input_tokens > 0
                 or residual_output_tokens > 0

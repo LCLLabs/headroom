@@ -127,7 +127,7 @@ async def test_prune_inbound_dumps_when_debug_enabled(
     )
     body = {"input": [{"type": "function_call_output", "call_id": "c1", "output": before_body}]}
     changed = await svc.prune_inbound(body, session_key="sess")
-    assert changed is True
+    assert changed.changed is True
     assert "c1" in body[PRUNED_CALL_IDS_KEY]
 
     metas = list(tmp_path.glob("*_reduce.json"))

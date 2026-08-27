@@ -33,9 +33,14 @@ from headroom.proxy.explore_pruner.reducers import (
     CoactReducer,
     SwePrunerReducer,
 )
+from headroom.proxy.explore_pruner.savings import (
+    apply_explore_prune_savings,
+    attach_explore_prune_tags,
+    merge_explore_prune_attribution,
+)
 from headroom.proxy.explore_pruner.service import ExploreToolService
 from headroom.proxy.explore_pruner.store import ExplorePrunerRecord, ExplorePrunerStore
-from headroom.proxy.explore_pruner.types import ReduceInput, ReduceResult
+from headroom.proxy.explore_pruner.types import PruneSavings, ReduceInput, ReduceResult
 
 __all__ = [
     "COACT_NAME",
@@ -48,11 +53,15 @@ __all__ = [
     "ExplorePrunerStore",
     "ExploreToolService",
     "PRUNED_CALL_IDS_KEY",
+    "PruneSavings",
     "ReduceInput",
     "ReduceResult",
     "SWE_PRUNER_NAME",
     "SwePrunerReducer",
     "append_explore_source_code_tool",
+    "apply_explore_prune_savings",
+    "attach_explore_prune_tags",
+    "merge_explore_prune_attribution",
     "build_explore_tool_service",
     "clear_reducer_registry",
     "explore_pruner_config_from_env",

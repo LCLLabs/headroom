@@ -245,7 +245,7 @@ async def test_inbound_hits_store_and_calls_reducer():
         "input": [_output("c1", _long_py(200))],
     }
     changed = await svc.prune_inbound(body, session_key="sess")
-    assert changed is True
+    assert changed.changed is True
     assert reducer.calls == 1
     assert body["input"][0]["output"] == "PRUNED_BODY"
     assert "c1" in body[PRUNED_CALL_IDS_KEY]
@@ -535,7 +535,7 @@ async def test_fail_open_paths():
     svc.rewrite_outbound_items([_explore_call()], session_key="s")
     truncated = "a" * 100 + "\nWarning: truncated output\n"
     body = {"input": [_output("c1", truncated)]}
-    assert await svc.prune_inbound(body, session_key="s") is False
+    assert (await svc.prune_inbound(body, session_key="s")).changed is False
 
     # non-py scope
     svc2 = ExploreToolService(reducer=FakeTextReducer(), min_chars_to_prune=10)
@@ -543,13 +543,13 @@ async def test_fail_open_paths():
         [_explore_call(path="/tmp/readme.md")], session_key="s2"
     )
     body2 = {"input": [_output("c1", _long_py(80))]}
-    assert await svc2.prune_inbound(body2, session_key="s2") is False
+    assert (await svc2.prune_inbound(body2, session_key="s2")).changed is False
 
     # short text
     svc3 = ExploreToolService(reducer=FakeTextReducer(), min_chars_to_prune=5000)
     svc3.rewrite_outbound_items([_explore_call()], session_key="s3")
     body3 = {"input": [_output("c1", "short")]}
-    assert await svc3.prune_inbound(body3, session_key="s3") is False
+    assert (await svc3.prune_inbound(body3, session_key="s3")).changed is False
 
     # reducer None
     svc4 = ExploreToolService(
@@ -557,7 +557,7 @@ async def test_fail_open_paths():
     )
     svc4.rewrite_outbound_items([_explore_call()], session_key="s4")
     body4 = {"input": [_output("c1", _long_py(80))]}
-    assert await svc4.prune_inbound(body4, session_key="s4") is False
+    assert (await svc4.prune_inbound(body4, session_key="s4")).changed is False
 
 
 @pytest.mark.asyncio
@@ -609,7 +609,7 @@ async def test_inbound_restores_explore_tool_name_for_upstream():
         ]
     }
     changed = await svc.prune_inbound(body, session_key="s")
-    assert changed is True
+    assert changed.changed is True
     call = body["input"][0]
     assert call["name"] == EXPLORE_TOOL_NAME
     assert call["call_id"] == "c1"
@@ -664,7 +664,7 @@ async def test_inbound_restores_explore_name_even_when_output_not_pruned():
     rewritten = svc.rewrite_outbound_items([_explore_call()], session_key="s")
     body = {"input": [rewritten[0], _output("c1", "short")]}
     changed = await svc.prune_inbound(body, session_key="s")
-    assert changed is True
+    assert changed.changed is True
     assert body["input"][0]["name"] == EXPLORE_TOOL_NAME
     assert body["input"][1]["output"] == "short"
 
@@ -1016,4 +1016,206 @@ async def test_http_sse_stream_rewrites_explore_before_client():
     assert rec is not None
     assert rec.focus_question == "How does auth work?"
 
+
+@pytest.mark.asyncio
+async def test_explore_prepare_and_prune_returns_savings_report():
+    from headroom.proxy.handlers.openai import _explore_prepare_and_prune
+
+    original = _long_py(80)
+    pruned = "SHORT"
+    svc = ExploreToolService(reducer=FakeTextReducer(pruned), min_chars_to_prune=10)
+    svc.rewrite_outbound_items([_explore_call()], session_key="s")
+    body: dict[str, Any] = {"input": [_output("c1", original)], "tools": []}
+    report = await _explore_prepare_and_prune(
+        svc,
+        body,
+        session_key="s",
+        request_id="r1",
+        count_text=_count_chars,
+    )
+    assert report.changed is True
+    assert report.tokens_saved == len(original) - len(pruned)
+    assert EXPLORE_TOOL_NAME in [t.get("name") for t in body["tools"]]
+
+
+def _count_chars(text: str) -> int:
+    return len(text)
+
+
+@pytest.mark.asyncio
+async def test_prune_inbound_reports_token_savings_with_same_counter():
+    from headroom.proxy.explore_pruner.types import PruneSavings
+
+    original = _long_py(200)
+    pruned = "PRUNED_BODY"
+    reducer = FakeTextReducer(pruned)
+    svc = ExploreToolService(reducer=reducer, min_chars_to_prune=100)
+    svc.rewrite_outbound_items([_explore_call()], session_key="sess")
+    body = {"input": [_output("c1", original)]}
+
+    report = await svc.prune_inbound(body, session_key="sess", count_text=_count_chars)
+
+    assert isinstance(report, PruneSavings)
+    assert report.changed is True
+    assert report.items == 1
+    assert report.tokens_before == len(original)
+    assert report.tokens_after == len(pruned)
+    assert report.tokens_saved == len(original) - len(pruned)
+    assert report.tokens_saved > 0
+
+
+@pytest.mark.asyncio
+async def test_prune_inbound_cache_hit_still_counts_savings():
+    original = _long_py(80)
+    pruned = "ONCE"
+    reducer = FakeTextReducer(pruned)
+    svc = ExploreToolService(reducer=reducer, min_chars_to_prune=10)
+    svc.rewrite_outbound_items([_explore_call()], session_key="s")
+    await svc.prune_inbound(
+        {"input": [_output("c1", original)]},
+        session_key="s",
+        count_text=_count_chars,
+    )
+    report = await svc.prune_inbound(
+        {"input": [_output("c1", original)]},
+        session_key="s",
+        count_text=_count_chars,
+    )
+    assert reducer.calls == 1
+    assert report.changed is True
+    assert report.tokens_saved == len(original) - len(pruned)
+    assert report.items == 1
+
+
+@pytest.mark.asyncio
+async def test_prune_inbound_skip_paths_report_zero_savings():
+    svc = ExploreToolService(reducer=FakeTextReducer(), min_chars_to_prune=10)
+    svc.rewrite_outbound_items([_explore_call()], session_key="s")
+    truncated = "a" * 100 + "\nWarning: truncated output\n"
+    report = await svc.prune_inbound(
+        {"input": [_output("c1", truncated)]},
+        session_key="s",
+        count_text=_count_chars,
+    )
+    assert report.changed is False
+    assert report.tokens_saved == 0
+    assert report.items == 0
+
+
+@pytest.mark.asyncio
+async def test_prune_inbound_inflation_clamps_saved_to_zero():
+    original = _long_py(80)
+    inflated = original + "\n" + original
+    reducer = FakeTextReducer(inflated)
+    svc = ExploreToolService(reducer=reducer, min_chars_to_prune=10)
+    svc.rewrite_outbound_items([_explore_call()], session_key="s")
+    report = await svc.prune_inbound(
+        {"input": [_output("c1", original)]},
+        session_key="s",
+        count_text=_count_chars,
+    )
+    assert report.changed is True
+    assert report.tokens_before == len(original)
+    assert report.tokens_after == len(inflated)
+    assert report.tokens_saved == 0
+
+
+def test_apply_explore_prune_savings_folds_into_headline_and_attribution():
+    from headroom.proxy.explore_pruner.savings import apply_explore_prune_savings
+    from headroom.proxy.explore_pruner.types import PruneSavings
+    from headroom.proxy.prometheus_metrics import PrometheusMetrics
+    from headroom.proxy.savings_attribution import from_tags
+    from headroom.proxy.tool_schema_savings_policy import headline_tokens_saved
+
+    report = PruneSavings(
+        tokens_before=100,
+        tokens_after=40,
+        tokens_saved=60,
+        items=1,
+        changed=True,
+    )
+    metrics = PrometheusMetrics()
+    tags: dict[str, object] = {}
+    transforms: list[str] = ["router:json"]
+    tokens_saved, attempted, original = apply_explore_prune_savings(
+        report,
+        tokens_saved=10,
+        attempted_input_tokens=20,
+        original_tokens=30,
+        transforms=transforms,
+        tags=tags,
+        metrics=metrics,
+    )
+    assert tokens_saved == 70
+    assert attempted == 120
+    assert original == 130
+    assert "explore_pruner" in transforms
+    assert metrics.tokens_saved_by_strategy["explore_pruner"] == 60
+    attributed = from_tags(tags)
+    assert attributed[0]["source"] == "explore_pruner"
+    assert attributed[0]["tokens"] == 60
+    assert headline_tokens_saved(tokens_saved, tags) == tokens_saved
+
+
+def test_apply_explore_prune_savings_noops_when_nothing_pruned():
+    from headroom.proxy.explore_pruner.savings import apply_explore_prune_savings
+    from headroom.proxy.explore_pruner.types import PruneSavings
+    from headroom.proxy.prometheus_metrics import PrometheusMetrics
+
+    metrics = PrometheusMetrics()
+    tags: dict[str, object] = {}
+    transforms: list[str] = []
+    tokens_saved, attempted, original = apply_explore_prune_savings(
+        PruneSavings(),
+        tokens_saved=5,
+        attempted_input_tokens=8,
+        original_tokens=9,
+        transforms=transforms,
+        tags=tags,
+        metrics=metrics,
+    )
+    assert (tokens_saved, attempted, original) == (5, 8, 9)
+    assert transforms == []
+    assert metrics.tokens_saved_by_strategy == {}
+
+
+def test_ws_prune_attribution_accumulates_then_clears_without_mutating_session_tags():
+    """WS sessions reuse one tag dict; prune ledgers must not land on it."""
+    from headroom.proxy.explore_pruner.savings import (
+        apply_explore_prune_savings,
+        attach_explore_prune_tags,
+        merge_explore_prune_attribution,
+    )
+    from headroom.proxy.explore_pruner.types import PruneSavings
+    from headroom.proxy.savings_attribution import SAVINGS_ATTRIBUTION_TAG, from_tags
+
+    session_tags = {"client": "codex"}
+    pending: dict[str, object] = {}
+
+    turn1: dict[str, object] = {}
+    apply_explore_prune_savings(
+        PruneSavings(tokens_before=10, tokens_after=4, tokens_saved=6, changed=True),
+        tokens_saved=0,
+        attempted_input_tokens=0,
+        tags=turn1,
+    )
+    merge_explore_prune_attribution(pending, turn1)
+
+    turn2: dict[str, object] = {}
+    apply_explore_prune_savings(
+        PruneSavings(tokens_before=20, tokens_after=13, tokens_saved=7, changed=True),
+        tokens_saved=0,
+        attempted_input_tokens=0,
+        tags=turn2,
+    )
+    merge_explore_prune_attribution(pending, turn2)
+
+    outcome_tags = attach_explore_prune_tags(session_tags, pending)
+    assert SAVINGS_ATTRIBUTION_TAG not in session_tags
+    attributed = [row for row in from_tags(outcome_tags) if row.get("source") == "explore_pruner"]
+    assert [row["tokens"] for row in attributed] == [6, 7]
+
+    pending.clear()
+    later = attach_explore_prune_tags(session_tags, pending)
+    assert from_tags(later) == []
 

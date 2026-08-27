@@ -31,6 +31,26 @@ class ReduceResult:
 
 
 @dataclass(frozen=True)
+class PruneSavings:
+    """Token accounting for one inbound explore-prune pass.
+
+    ``tokens_before`` / ``tokens_after`` are measured with the caller-supplied
+    tokenizer (the same ruler ContentRouter uses). ``tokens_saved`` is clamped
+    at zero so an inflation never reduces the headline.
+    """
+
+    tokens_before: int = 0
+    tokens_after: int = 0
+    tokens_saved: int = 0
+    items: int = 0
+    changed: bool = False
+    elapsed_ms: float = 0.0
+
+    def __bool__(self) -> bool:
+        return self.changed
+
+
+@dataclass(frozen=True)
 class TokenScore:
     """One entry from swe-pruner ``token_scores``: ``(token_string, score)``."""
 

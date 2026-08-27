@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import time
+from collections.abc import Callable
 from typing import Any
 
 from headroom.proxy.explore_pruner.ast_protect import strip_shell_line_numbers
@@ -26,9 +27,19 @@ from headroom.proxy.explore_pruner.focus import (
 )
 from headroom.proxy.explore_pruner.protocol import ContextReducer
 from headroom.proxy.explore_pruner.store import ExplorePrunerRecord, ExplorePrunerStore
-from headroom.proxy.explore_pruner.types import ReduceInput
+from headroom.proxy.explore_pruner.types import PruneSavings, ReduceInput
 
 logger = logging.getLogger(__name__)
+
+
+def _safe_count(count_text: Callable[[str], int] | None, text: str) -> int:
+    """Count tokens with the caller-supplied ruler; never raise."""
+    if count_text is None:
+        return 0
+    try:
+        return max(int(count_text(text)), 0)
+    except Exception:
+        return 0
 
 
 class ExploreToolService:
@@ -147,20 +158,40 @@ class ExploreToolService:
         body: dict[str, Any],
         *,
         session_key: str,
-    ) -> bool:
+        count_text: Callable[[str], int] | None = None,
+    ) -> PruneSavings:
         """Prune function_call_output items and restore explore calls for upstream.
 
         Client transcripts store rewritten ``exec_command`` items. This rewrites
         those back to ``explore_source_code`` (using the outbound store) so the
         model sees a consistent tool name, then prunes matching outputs.
 
-        Returns True when the body input was modified.
+        ``count_text`` is the same tokenizer ContentRouter uses. When omitted,
+        the rewrite still runs but token totals stay zero.
+
+        Returns a :class:`PruneSavings` report (``changed`` is True when the
+        body input was modified).
         """
+        started = time.perf_counter()
         items = normalize_responses_input(body.get("input"))
         if not items:
-            return False
+            return PruneSavings(elapsed_ms=(time.perf_counter() - started) * 1000.0)
 
         changed = False
+        tokens_before = 0
+        tokens_after = 0
+        tokens_saved = 0
+        pruned_item_count = 0
+
+        def _note_rewrite(original_text: str, rewritten_text: str) -> None:
+            nonlocal tokens_before, tokens_after, tokens_saved, pruned_item_count
+            before = _safe_count(count_text, original_text)
+            after = _safe_count(count_text, rewritten_text)
+            tokens_before += before
+            tokens_after += after
+            tokens_saved += max(0, before - after)
+            pruned_item_count += 1
+
         working: list[Any] = []
         for item in items:
             restored = self._restore_explore_call_item(item, session_key)
@@ -190,6 +221,8 @@ class ExploreToolService:
 
             record = self._store.get(session_key, call_id_s)
             if record is not None and record.pruned_output:
+                original_text = aggregate_output_text(item)
+                _note_rewrite(original_text, record.pruned_output)
                 new_items.append(rewrite_pruned_output(item, record.pruned_output))
                 pruned_ids.add(call_id_s)
                 changed = True
@@ -277,6 +310,7 @@ class ExploreToolService:
                     pruned_output=pruned,
                 ),
             )
+            _note_rewrite(text, pruned)
             new_items.append(rewrite_pruned_output(item, pruned))
             pruned_ids.add(call_id_s)
             changed = True
@@ -286,7 +320,14 @@ class ExploreToolService:
             if pruned_ids:
                 # Use a list so later json.dumps(body) in compression stays valid.
                 body[PRUNED_CALL_IDS_KEY] = sorted(pruned_ids)
-        return changed
+        return PruneSavings(
+            tokens_before=tokens_before,
+            tokens_after=tokens_after,
+            tokens_saved=tokens_saved,
+            items=pruned_item_count,
+            changed=changed,
+            elapsed_ms=(time.perf_counter() - started) * 1000.0,
+        )
 
     def _restore_explore_call_item(self, item: Any, session_key: str) -> Any:
         """Map client exec_command history back to explore_source_code for upstream."""
