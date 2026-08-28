@@ -148,7 +148,7 @@ class ExplorePrunerConfig:
     threshold: float | None = None
     always_keep_first_frags: bool | None = None
     chunk_overlap_tokens: int | None = None
-    ast_protect_enabled: bool = True  # swe_pruner only; ignored by other reducers
+    ast_protect_enabled: bool = True  # swe_pruner + Python only; ignored by other reducers
     rebuild_fallback: str = "pruned"
     fail_open: bool = True
     instructions_enabled: bool = True

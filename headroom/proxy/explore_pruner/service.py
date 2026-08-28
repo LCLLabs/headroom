@@ -15,7 +15,7 @@ from headroom.proxy.explore_pruner.focus import (
     PRUNED_CALL_IDS_KEY,
     aggregate_output_text,
     append_explore_source_code_tool,
-    has_python_file_scope,
+    has_supported_source_file_scope,
     is_explore_source_code_call,
     normalize_responses_input,
     parse_explore_source_fields,
@@ -249,9 +249,9 @@ class ExploreToolService:
                 )
                 new_items.append(item)
                 continue
-            if has_python_file_scope(commands) is not True:
+            if has_supported_source_file_scope(commands) is not True:
                 logger.debug(
-                    "explore_pruner skip call_id=%s reason=no_python_file",
+                    "explore_pruner skip call_id=%s reason=unsupported_file",
                     call_id_s,
                 )
                 new_items.append(item)

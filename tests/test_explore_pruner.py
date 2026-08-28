@@ -15,6 +15,8 @@ from headroom.proxy.explore_pruner.focus import (
     PRUNED_CALL_IDS_KEY,
     append_explore_source_code_tool,
     clamp_explore_window,
+    has_python_file_scope,
+    has_supported_source_file_scope,
     is_explore_source_code_call,
     rewrite_explore_call_to_exec,
     tool_output_looks_truncated,
@@ -167,7 +169,11 @@ async def test_swe_pruner_fallback_rewrites_filtered_markers():
         return_value=rebuilt,
     ):
         out = reducer._apply_ast_rebuild(
-            ReduceInput(content="x = 0\n", query="Why?", config={"commands": ["sed"]}),
+            ReduceInput(
+                content="x = 0\n",
+                query="Why?",
+                config={"commands": ["sed -n '1,40p' /tmp/app.py"]},
+            ),
             raw,
         )
     assert out.metadata["ast_rebuild"] is False
@@ -296,11 +302,73 @@ async def test_swe_pruner_ast_rebuild():
         return_value=rebuilt,
     ) as mock_ast:
         out = reducer._apply_ast_rebuild(
-            ReduceInput(content="x = 0\nx = 1\n", query="Why?", config={"commands": ["sed"]}),
+            ReduceInput(
+                content="x = 0\nx = 1\n",
+                query="Why?",
+                config={"commands": ["sed -n '1,40p' /tmp/app.py"]},
+            ),
             raw,
         )
         mock_ast.assert_called_once()
     assert out.content == "REBUILT\n"
+
+
+def test_swe_pruner_skips_ast_rebuild_for_non_python():
+    from headroom.proxy.explore_pruner.reducers.swe_pruner import SwePrunerReducer
+
+    reducer = SwePrunerReducer(
+        api_base="http://127.0.0.1:9",
+        ast_protect_enabled=True,
+    )
+    raw = ReduceResult(
+        content="(filtered 2 lines)\nfn main() {}\n",
+        kept_frags=[3],
+    )
+    with patch(
+        "headroom.proxy.explore_pruner.reducers.swe_pruner.rebuild_python_from_pruned"
+    ) as mock_ast:
+        out = reducer._apply_ast_rebuild(
+            ReduceInput(
+                content="mod a;\nmod b;\nfn main() {}\n",
+                query="Why?",
+                config={"commands": ["sed -n '1,40p' /tmp/main.rs"]},
+            ),
+            raw,
+        )
+        mock_ast.assert_not_called()
+    assert out.metadata.get("ast_rebuild") is False
+    assert out.metadata.get("ast_skip_reason") == "non_python"
+    assert "(filtered" not in out.content
+    assert out.content.startswith("(compressed 2 lines: omitted)")
+
+
+def test_swe_pruner_skips_ast_rebuild_when_disabled():
+    from headroom.proxy.explore_pruner.reducers.swe_pruner import SwePrunerReducer
+
+    reducer = SwePrunerReducer(
+        api_base="http://127.0.0.1:9",
+        ast_protect_enabled=False,
+    )
+    raw = ReduceResult(
+        content="(filtered 1 lines)\nx = 1\n",
+        kept_frags=[2],
+    )
+    with patch(
+        "headroom.proxy.explore_pruner.reducers.swe_pruner.rebuild_python_from_pruned"
+    ) as mock_ast:
+        out = reducer._apply_ast_rebuild(
+            ReduceInput(
+                content="x = 0\nx = 1\n",
+                query="Why?",
+                config={"commands": ["sed -n '1,40p' /tmp/app.py"]},
+            ),
+            raw,
+        )
+        mock_ast.assert_not_called()
+    assert out.metadata.get("ast_rebuild") is False
+    assert out.metadata.get("ast_skip_reason") == "disabled"
+    assert "(filtered" not in out.content
+    assert out.content.startswith("(compressed 1 lines: omitted)")
 
 
 @pytest.mark.asyncio
@@ -342,7 +410,11 @@ async def test_swe_pruner_reduce_applies_ast_after_http():
         ),
     ):
         out = await reducer.reduce(
-            ReduceInput(content="x = 0\nx = 1\n", query="Why?", config={"commands": []})
+            ReduceInput(
+                content="x = 0\nx = 1\n",
+                query="Why?",
+                config={"commands": ["sed -n '1,40p' /tmp/app.py"]},
+            )
         )
     assert out is not None
     assert out.content == "FROM_AST\n"
@@ -537,7 +609,7 @@ async def test_fail_open_paths():
     body = {"input": [_output("c1", truncated)]}
     assert (await svc.prune_inbound(body, session_key="s")).changed is False
 
-    # non-py scope
+    # unsupported file
     svc2 = ExploreToolService(reducer=FakeTextReducer(), min_chars_to_prune=10)
     svc2.rewrite_outbound_items(
         [_explore_call(path="/tmp/readme.md")], session_key="s2"
@@ -558,6 +630,74 @@ async def test_fail_open_paths():
     svc4.rewrite_outbound_items([_explore_call()], session_key="s4")
     body4 = {"input": [_output("c1", _long_py(80))]}
     assert (await svc4.prune_inbound(body4, session_key="s4")).changed is False
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/tmp/app.py",
+        "/tmp/app.js",
+        "/tmp/app.ts",
+        "/tmp/app.tsx",
+        "/tmp/app.go",
+        "/tmp/app.rs",
+        "/tmp/App.java",
+        "/tmp/app.c",
+        "/tmp/app.h",
+        "/tmp/app.cc",
+        "/tmp/app.cpp",
+        "/tmp/app.cxx",
+        "/tmp/app.hpp",
+        "/tmp/app.hxx",
+        "/tmp/app.hh",
+        "/tmp/App.JS",
+        "/tmp/mod.CPP",
+    ],
+)
+def test_supported_source_file_scope(path: str):
+    cmd = f"sed -n '1,80p' {path}"
+    assert has_supported_source_file_scope([cmd]) is True
+
+
+@pytest.mark.parametrize(
+    "path",
+    ["/tmp/readme.md", "/tmp/data.json", "/tmp/notes.txt", "/tmp/app.pyi"],
+)
+def test_unsupported_source_file_scope(path: str):
+    cmd = f"sed -n '1,80p' {path}"
+    assert has_supported_source_file_scope([cmd]) is not True
+    assert has_python_file_scope([cmd]) is not True
+
+
+def test_python_file_scope_only_py():
+    assert has_python_file_scope(["sed -n '1,80p' /tmp/app.py"]) is True
+    assert has_python_file_scope(["sed -n '1,80p' /tmp/app.js"]) is False
+    assert has_python_file_scope(["sed"]) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/tmp/app.js",
+        "/tmp/app.ts",
+        "/tmp/app.tsx",
+        "/tmp/app.go",
+        "/tmp/app.rs",
+        "/tmp/App.java",
+        "/tmp/app.c",
+        "/tmp/app.cpp",
+    ],
+)
+async def test_inbound_prunes_supported_non_python_languages(path: str):
+    reducer = FakeTextReducer("PRUNED_BODY")
+    svc = ExploreToolService(reducer=reducer, min_chars_to_prune=10)
+    svc.rewrite_outbound_items([_explore_call(path=path)], session_key="s")
+    body = {"input": [_output("c1", _long_py(80))]}
+    result = await svc.prune_inbound(body, session_key="s")
+    assert result.changed is True
+    assert reducer.calls == 1
+    assert body["input"][0]["output"] == "PRUNED_BODY"
 
 
 @pytest.mark.asyncio
@@ -731,6 +871,34 @@ def test_factory_disabled_returns_none():
     from headroom.proxy.explore_pruner.factory import build_explore_tool_service
 
     assert build_explore_tool_service(ExplorePrunerConfig(enabled=False)) is None
+
+
+def test_factory_ast_protect_env_switch(monkeypatch):
+    from headroom.proxy.explore_pruner.factory import (
+        build_explore_tool_service,
+        explore_pruner_config_from_env,
+    )
+    from headroom.proxy.explore_pruner.reducers.swe_pruner import SwePrunerReducer
+
+    monkeypatch.setenv("HEADROOM_EXPLORE_AST_PROTECT", "0")
+    cfg = explore_pruner_config_from_env(ExplorePrunerConfig(enabled=True))
+    assert cfg.ast_protect_enabled is False
+
+    monkeypatch.setattr(
+        "headroom.proxy.explore_pruner.factory.init_tree_sitter",
+        lambda: True,
+    )
+    svc = build_explore_tool_service(
+        ExplorePrunerConfig(
+            enabled=True,
+            api_base="http://127.0.0.1:9",
+            ast_protect_enabled=False,
+        )
+    )
+    assert svc is not None
+    reducer = get_reducer("swe_pruner")
+    assert isinstance(reducer, SwePrunerReducer)
+    assert reducer._ast_protect_enabled is False
 
 
 def test_factory_builds_swe_pruner(monkeypatch):

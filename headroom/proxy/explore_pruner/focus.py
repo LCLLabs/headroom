@@ -196,12 +196,52 @@ def extract_scoped_file_paths(commands: list[str]) -> list[str]:
     return paths
 
 
-def has_python_file_scope(commands: list[str]) -> bool | None:
-    """Return True when scope includes .py, False for known non-.py, else None."""
+# Explore prune is allowed for these source suffixes (case-insensitive).
+PRUNABLE_SOURCE_SUFFIXES = frozenset(
+    {
+        ".py",
+        ".js",
+        ".ts",
+        ".tsx",
+        ".go",
+        ".rs",
+        ".java",
+        ".c",
+        ".h",
+        ".cc",
+        ".cpp",
+        ".cxx",
+        ".c++",
+        ".hpp",
+        ".hxx",
+        ".hh",
+        ".h++",
+    }
+)
+PYTHON_SOURCE_SUFFIXES = frozenset({".py"})
+
+
+def _path_suffix(path: str) -> str:
+    return PurePath(path).suffix.lower()
+
+
+def has_supported_source_file_scope(commands: list[str]) -> bool | None:
+    """Return True when scope includes a prunable source file, else False/None."""
     paths = extract_scoped_file_paths(commands)
     if not paths:
         return None
-    return any(path.endswith(".py") for path in paths)
+    return any(_path_suffix(path) in PRUNABLE_SOURCE_SUFFIXES for path in paths)
+
+
+def has_python_file_scope(commands: list[str]) -> bool | None:
+    """Return True when every scoped path is .py, False for other files, else None."""
+    paths = extract_scoped_file_paths(commands)
+    if not paths:
+        return None
+    suffixes = [_path_suffix(path) for path in paths]
+    if all(suffix in PYTHON_SOURCE_SUFFIXES for suffix in suffixes):
+        return True
+    return False
 
 
 def append_explore_source_code_tool(tools: list) -> list:

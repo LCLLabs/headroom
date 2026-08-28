@@ -79,7 +79,7 @@ def explore_pruner_config_from_env(
 
 
 def _build_swe_pruner_reducer(cfg: ExplorePrunerConfig) -> SwePrunerReducer:
-    """Construct swe_pruner with optional AST (tree-sitter warmed when enabled)."""
+    """Construct swe_pruner. AST rebuild is opt-in and Python-only at apply time."""
     ast_ok = True
     if cfg.ast_protect_enabled:
         ast_ok = init_tree_sitter()
