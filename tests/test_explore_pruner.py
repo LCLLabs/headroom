@@ -1186,6 +1186,31 @@ async def test_http_sse_stream_rewrites_explore_before_client():
 
 
 @pytest.mark.asyncio
+async def test_anthropic_prepare_and_prune_returns_savings_report():
+    from headroom.proxy.handlers.anthropic import _explore_prepare_and_prune_anthropic
+
+    original = _long_py(80)
+    pruned = "SHORT"
+    svc = ExploreToolService(reducer=FakeTextReducer(pruned), min_chars_to_prune=10)
+    svc.rewrite_outbound_blocks([_anthropic_explore_use()], session_key="s")
+    body: dict[str, Any] = {
+        "tools": [],
+        "messages": [{"role": "user", "content": [_anthropic_tool_result("toolu_01", original)]}],
+    }
+    report = await _explore_prepare_and_prune_anthropic(
+        svc,
+        body,
+        session_key="s",
+        request_id="r1",
+        count_text=_count_chars,
+    )
+    assert report.changed is True
+    assert report.tokens_saved == len(original) - len(pruned)
+    assert EXPLORE_TOOL_NAME in [t.get("name") for t in body["tools"]]
+    assert body["messages"][0]["content"][0]["content"] == pruned
+
+
+@pytest.mark.asyncio
 async def test_explore_prepare_and_prune_returns_savings_report():
     from headroom.proxy.handlers.openai import _explore_prepare_and_prune
 
@@ -1386,4 +1411,363 @@ def test_ws_prune_attribution_accumulates_then_clears_without_mutating_session_t
     pending.clear()
     later = attach_explore_prune_tags(session_tags, pending)
     assert from_tags(later) == []
+
+
+# ---------------------------------------------------------------------------
+# Anthropic / Claude Messages wire adapter (explore_source_code → Read)
+# ---------------------------------------------------------------------------
+
+
+def _anthropic_explore_use(
+    tool_id: str = "toolu_01",
+    path: str = "/tmp/app.py",
+    start: int = 1,
+    end: int = 50,
+    focus: str = "How does auth work?",
+) -> dict[str, Any]:
+    return {
+        "type": "tool_use",
+        "id": tool_id,
+        "name": EXPLORE_TOOL_NAME,
+        "input": {
+            "path": path,
+            "focus_question": focus,
+            "start_line": start,
+            "end_line": end,
+        },
+    }
+
+
+def _anthropic_tool_result(tool_id: str, text: str) -> dict[str, Any]:
+    return {"type": "tool_result", "tool_use_id": tool_id, "content": text}
+
+
+def test_anthropic_inject_tool_and_system_no_dup():
+    from headroom.proxy.explore_pruner.focus import EXPLORE_SOURCE_CODE_TOOL_ANTHROPIC
+
+    svc = ExploreToolService(reducer=FakeTextReducer())
+    body: dict[str, Any] = {
+        "tools": [{"name": "Read", "input_schema": {"type": "object"}}],
+        "system": "hello",
+    }
+    svc.prepare_request_anthropic(body)
+    names = [t.get("name") for t in body["tools"]]
+    assert names.count(EXPLORE_TOOL_NAME) == 1
+    injected = next(t for t in body["tools"] if t.get("name") == EXPLORE_TOOL_NAME)
+    assert injected["input_schema"] == EXPLORE_SOURCE_CODE_TOOL_ANTHROPIC["input_schema"]
+    assert "parameters" not in injected
+    assert EXPLORE_TOOL_INSTRUCTIONS in body["system"]
+
+    system_after = body["system"]
+    tools_len = len(body["tools"])
+    svc.prepare_request_anthropic(body)
+    assert len(body["tools"]) == tools_len
+    assert body["system"] == system_after
+    assert body["system"].count(EXPLORE_TOOL_INSTRUCTIONS) == 1
+
+
+def test_anthropic_inject_appends_system_block_list():
+    svc = ExploreToolService(reducer=FakeTextReducer())
+    body: dict[str, Any] = {
+        "tools": [],
+        "system": [{"type": "text", "text": "base", "cache_control": {"type": "ephemeral"}}],
+    }
+    svc.prepare_request_anthropic(body)
+    assert isinstance(body["system"], list)
+    assert body["system"][0]["text"] == "base"
+    assert EXPLORE_TOOL_INSTRUCTIONS in body["system"][-1]["text"]
+    svc.prepare_request_anthropic(body)
+    assert (
+        sum(
+            1
+            for b in body["system"]
+            if isinstance(b, dict) and EXPLORE_TOOL_INSTRUCTIONS in str(b.get("text") or "")
+        )
+        == 1
+    )
+
+
+def test_explore_to_read_rewrite_and_store():
+    svc = ExploreToolService(reducer=FakeTextReducer(), explore_max_lines=400)
+    block = _anthropic_explore_use(end=900)
+    out = svc.rewrite_outbound_blocks([block], session_key="s1")
+    rewritten = out[0]
+    assert rewritten["name"] == "Read"
+    assert rewritten["id"] == "toolu_01"
+    assert rewritten["input"]["file_path"] == "/tmp/app.py"
+    assert rewritten["input"]["offset"] == 1
+    assert rewritten["input"]["limit"] == 400
+    assert "focus_question" not in rewritten["input"]
+    rec = svc.store.get("s1", "toolu_01")
+    assert rec is not None
+    assert rec.focus_question == "How does auth work?"
+    assert rec.explore_path == "/tmp/app.py"
+    assert rec.explore_start_line == 1
+    assert rec.explore_end_line == 900
+    assert rec.commands and "/tmp/app.py" in rec.commands[0]
+
+
+def test_anthropic_missing_line_args_no_rewrite():
+    from headroom.proxy.explore_pruner.focus import (
+        is_explore_anthropic_call,
+        rewrite_explore_call_to_read,
+    )
+
+    block = {
+        "type": "tool_use",
+        "id": "toolu_x",
+        "name": EXPLORE_TOOL_NAME,
+        "input": {"path": "/tmp/a.py", "focus_question": "Why?"},
+    }
+    rewritten, focus, _ = rewrite_explore_call_to_read(block)
+    assert is_explore_anthropic_call(rewritten)
+    assert focus is None
+
+
+@pytest.mark.asyncio
+async def test_anthropic_inbound_prunes_tool_result_and_restores_history():
+    reducer = FakeTextReducer("PRUNED_BODY")
+    svc = ExploreToolService(reducer=reducer, min_chars_to_prune=100)
+    svc.rewrite_outbound_blocks([_anthropic_explore_use()], session_key="sess")
+    body: dict[str, Any] = {
+        "messages": [
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_01",
+                        "name": "Read",
+                        "input": {"file_path": "/tmp/app.py", "offset": 1, "limit": 50},
+                    }
+                ],
+            },
+            {
+                "role": "user",
+                "content": [_anthropic_tool_result("toolu_01", _long_py(200))],
+            },
+        ]
+    }
+    report = await svc.prune_inbound_anthropic(body, session_key="sess")
+    assert report.changed is True
+    assert reducer.calls == 1
+    restored = body["messages"][0]["content"][0]
+    assert restored["name"] == EXPLORE_TOOL_NAME
+    assert restored["input"]["path"] == "/tmp/app.py"
+    assert restored["input"]["focus_question"] == "How does auth work?"
+    pruned_block = body["messages"][1]["content"][0]
+    assert pruned_block["content"] == "PRUNED_BODY"
+    assert "toolu_01" in body[PRUNED_CALL_IDS_KEY]
+
+
+@pytest.mark.asyncio
+async def test_anthropic_inbound_fail_open_leaves_tool_result():
+    svc = ExploreToolService(reducer=FakeNoneReducer(), min_chars_to_prune=10, fail_open=True)
+    svc.rewrite_outbound_blocks([_anthropic_explore_use()], session_key="s")
+    original = _long_py(80)
+    body: dict[str, Any] = {
+        "messages": [
+            {"role": "user", "content": [_anthropic_tool_result("toolu_01", original)]}
+        ]
+    }
+    report = await svc.prune_inbound_anthropic(body, session_key="s")
+    assert report.changed is False
+    assert body["messages"][0]["content"][0]["content"] == original
+
+
+def test_anthropic_stream_rewriter_renames_start_and_rewrites_stop():
+    from headroom.proxy.explore_pruner.stream_rewrite import ExploreAnthropicStreamRewriter
+
+    svc = ExploreToolService(reducer=FakeTextReducer(), explore_max_lines=400)
+    rewriter = ExploreAnthropicStreamRewriter(svc, session_key="sess")
+    start = rewriter.rewrite_event(
+        {
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {
+                "type": "tool_use",
+                "id": "toolu_01",
+                "name": EXPLORE_TOOL_NAME,
+                "input": {},
+            },
+        }
+    )
+    assert start is not None
+    assert not isinstance(start, list)
+    assert start["content_block"]["name"] == "Read"
+
+    assert (
+        rewriter.rewrite_event(
+            {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "input_json_delta", "partial_json": '{"path":'},
+            }
+        )
+        is None
+    )
+
+    rest = json.dumps(
+        {
+            "path": "/tmp/app.py",
+            "focus_question": "How does auth work?",
+            "start_line": 1,
+            "end_line": 50,
+        }
+    )[len('{"path":') :]
+    assert (
+        rewriter.rewrite_event(
+            {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "input_json_delta", "partial_json": rest},
+            }
+        )
+        is None
+    )
+
+    stop = rewriter.rewrite_event({"type": "content_block_stop", "index": 0})
+    assert isinstance(stop, list)
+    assert stop[0]["type"] == "content_block_delta"
+    read_args = json.loads(stop[0]["delta"]["partial_json"])
+    assert read_args["file_path"] == "/tmp/app.py"
+    assert read_args["offset"] == 1
+    assert read_args["limit"] == 50
+    assert "focus_question" not in read_args
+    assert stop[1] == {"type": "content_block_stop", "index": 0}
+    rec = svc.store.get("sess", "toolu_01")
+    assert rec is not None
+    assert rec.focus_question == "How does auth work?"
+
+
+def test_rewrite_sse_event_bytes_emits_read_delta_then_stop():
+    from headroom.proxy.explore_pruner.stream_rewrite import (
+        ExploreAnthropicStreamRewriter,
+        rewrite_sse_event_bytes,
+    )
+
+    svc = ExploreToolService(reducer=FakeTextReducer())
+    rewriter = ExploreAnthropicStreamRewriter(svc, session_key="sess")
+    start = (
+        b"event: content_block_start\n"
+        b'data: {"type":"content_block_start","index":0,'
+        b'"content_block":{"type":"tool_use","id":"toolu_01",'
+        b'"name":"explore_source_code","input":{}}}\n\n'
+    )
+    start_out = rewrite_sse_event_bytes(start, rewriter)
+    assert start_out is not None
+    assert b"explore_source_code" not in start_out
+    assert b'"name": "Read"' in start_out or b'"name":"Read"' in start_out
+
+    delta = (
+        b"event: content_block_delta\n"
+        b'data: {"type":"content_block_delta","index":0,'
+        b'"delta":{"type":"input_json_delta","partial_json":'
+        + json.dumps(
+            json.dumps(
+                {
+                    "path": "/tmp/app.py",
+                    "focus_question": "How does auth work?",
+                    "start_line": 1,
+                    "end_line": 50,
+                }
+            )
+        ).encode()
+        + b"}}\n\n"
+    )
+    assert rewrite_sse_event_bytes(delta, rewriter) is None
+
+    stop = b'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n'
+    stop_out = rewrite_sse_event_bytes(stop, rewriter)
+    assert stop_out is not None
+    assert b"content_block_delta" in stop_out
+    assert b"file_path" in stop_out
+    assert b"content_block_stop" in stop_out
+    assert b"explore_source_code" not in stop_out
+    assert b"focus_question" not in stop_out
+
+
+@pytest.mark.asyncio
+async def test_anthropic_http_sse_stream_rewrites_explore_before_client():
+    from unittest.mock import AsyncMock, MagicMock
+
+    import httpx
+
+    from headroom.proxy.server import HeadroomProxy
+
+    explore_json = json.dumps(
+        {
+            "path": "/tmp/app.py",
+            "focus_question": "How does auth work?",
+            "start_line": 10,
+            "end_line": 40,
+        }
+    )
+    sse = (
+        b"event: content_block_start\n"
+        b'data: {"type":"content_block_start","index":0,'
+        b'"content_block":{"type":"tool_use","id":"toolu_01",'
+        b'"name":"explore_source_code","input":{}}}\n\n'
+        b"event: content_block_delta\n"
+        b'data: {"type":"content_block_delta","index":0,'
+        b'"delta":{"type":"input_json_delta","partial_json":'
+        + json.dumps(explore_json).encode()
+        + b"}}\n\n"
+        b"event: content_block_stop\n"
+        b'data: {"type":"content_block_stop","index":0}\n\n'
+    )
+
+    proxy = object.__new__(HeadroomProxy)
+    proxy.http_client = MagicMock(spec=httpx.AsyncClient)
+    proxy._config = MagicMock()
+    proxy._config.memory_enabled = False
+    proxy._config.ccr_inject_tool = False
+    proxy._config.retry_enabled = False
+    proxy._config.retry_max_attempts = 1
+    proxy._config.retry_base_delay_ms = 0
+    proxy._config.retry_max_delay_ms = 0
+    proxy.config = proxy._config
+    proxy.memory_handler = None
+    proxy.memory_manager = None
+    proxy._parse_sse_usage_from_buffer = MagicMock(return_value=None)
+    proxy._finalize_stream_response = AsyncMock(return_value=None)
+    proxy.explore_tool_service = ExploreToolService(
+        reducer=FakeTextReducer(), explore_max_lines=400
+    )
+
+    mock_response = AsyncMock()
+    mock_response.headers = httpx.Headers({"content-type": "text/event-stream"})
+    mock_response.status_code = 200
+
+    async def aiter_bytes():
+        yield sse[:50]
+        yield sse[50:]
+
+    mock_response.aiter_bytes = aiter_bytes
+    mock_response.aclose = AsyncMock()
+    proxy.http_client.build_request = MagicMock(return_value=MagicMock())
+    proxy.http_client.send = AsyncMock(return_value=mock_response)
+
+    result = await proxy._stream_response(
+        url="https://api.anthropic.com/v1/messages",
+        headers={"x-api-key": "sk-ant-test", "session-id": "sess-a"},
+        body={"model": "claude-sonnet-4-6", "stream": True, "messages": []},
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+        request_id="req-explore-ant",
+        original_tokens=10,
+        optimized_tokens=10,
+        tokens_saved=0,
+        transforms_applied=[],
+        tags={},
+        optimization_latency=0.0,
+        session_key="sess-a",
+    )
+    body = b"".join([chunk async for chunk in result.body_iterator])
+    assert b"explore_source_code" not in body
+    assert b'"name":"Read"' in body or b'"name": "Read"' in body
+    assert b"file_path" in body
+    rec = proxy.explore_tool_service.store.get("sess-a", "toolu_01")
+    assert rec is not None
+    assert rec.focus_question == "How does auth work?"
 

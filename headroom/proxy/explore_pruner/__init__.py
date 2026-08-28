@@ -1,4 +1,4 @@
-"""Explore-tool + pluggable context reducers for OpenAI Responses."""
+"""Explore-tool + pluggable context reducers for Responses and Anthropic Messages."""
 
 from __future__ import annotations
 

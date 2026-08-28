@@ -135,7 +135,7 @@ class RateLimitState:
 
 @dataclass
 class ExplorePrunerConfig:
-    """Explore-tool + pluggable context reducer (OpenAI Responses path)."""
+    """Explore-tool + pluggable context reducer (Responses + Anthropic Messages)."""
 
     enabled: bool = False
     reducer: str = "swe_pruner"  # swe_pruner | coact
@@ -211,7 +211,7 @@ class ProxyConfig:
     # on request size / tool presence. None keeps behavior unchanged.
     model_router: ModelRouterConfig | None = None
 
-    # Explore-tool pruner (OpenAI Responses). Opt-in; default off.
+    # Explore-tool pruner (OpenAI Responses + Anthropic Messages). Opt-in; default off.
     # Env: HEADROOM_EXPLORE_PRUNER_ENABLED, HEADROOM_EXPLORE_REDUCER,
     # HEADROOM_PRUNER_API_BASE / HEADROOM_PRUNER_API_KEY.
     explore_pruner: ExplorePrunerConfig = field(default_factory=ExplorePrunerConfig)

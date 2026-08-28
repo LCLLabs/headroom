@@ -1511,6 +1511,7 @@ class StreamingMixin:
         }
 
         from headroom.proxy.explore_pruner.stream_rewrite import (
+            ExploreAnthropicStreamRewriter,
             ExploreStreamRewriter,
             pop_complete_sse_event,
             resolve_explore_session_key,
@@ -1518,7 +1519,7 @@ class StreamingMixin:
         )
 
         explore_svc = getattr(self, "explore_tool_service", None)
-        explore_rewriter: ExploreStreamRewriter | None = None
+        explore_rewriter: ExploreStreamRewriter | ExploreAnthropicStreamRewriter | None = None
         if explore_svc is not None and provider == "openai" and "/responses" in url:
             explore_rewriter = ExploreStreamRewriter(
                 explore_svc,
@@ -1526,6 +1527,15 @@ class StreamingMixin:
                     headers=headers,
                     body=body if isinstance(body, dict) else None,
                     request_id=request_id,
+                ),
+            )
+        elif explore_svc is not None and provider == "anthropic":
+            explore_rewriter = ExploreAnthropicStreamRewriter(
+                explore_svc,
+                session_key=resolve_explore_session_key(
+                    headers=headers,
+                    body=body if isinstance(body, dict) else None,
+                    request_id=session_key or request_id,
                 ),
             )
 
@@ -1583,9 +1593,7 @@ class StreamingMixin:
                                 raw_event = pop_complete_sse_event(explore_sse_buf)
                                 if raw_event is None:
                                     break
-                                rewritten = rewrite_sse_event_bytes(
-                                    raw_event, explore_rewriter
-                                )
+                                rewritten = rewrite_sse_event_bytes(raw_event, explore_rewriter)
                                 if rewritten is None:
                                     continue
                                 yield rewritten

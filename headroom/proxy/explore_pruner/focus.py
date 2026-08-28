@@ -12,6 +12,9 @@ FocusSource = Literal["arg", "none"]
 FOCUS_ARG_KEY = "focus_question"
 FUNCTION_CALL_TYPE = "function_call"
 FUNCTION_OUTPUT_TYPE = "function_call_output"
+TOOL_USE_TYPE = "tool_use"
+TOOL_RESULT_TYPE = "tool_result"
+READ_TOOL_NAME = "Read"
 
 EXPLORE_TOOL_NAME = "explore_source_code"
 EXPLORE_PATH_KEY = "path"
@@ -113,6 +116,12 @@ EXPLORE_SOURCE_CODE_TOOL: dict = {
     },
 }
 
+EXPLORE_SOURCE_CODE_TOOL_ANTHROPIC: dict = {
+    "name": EXPLORE_TOOL_NAME,
+    "description": EXPLORE_SOURCE_CODE_TOOL["description"],
+    "input_schema": dict(EXPLORE_SOURCE_CODE_TOOL["parameters"]),
+}
+
 # Internal body key recording call_ids already pruned this request.
 PRUNED_CALL_IDS_KEY = "_headroom_explore_pruned_call_ids"
 
@@ -120,9 +129,13 @@ PRUNED_CALL_IDS_KEY = "_headroom_explore_pruned_call_ids"
 def is_explore_source_code_call(item: dict) -> bool:
     """True for function_call named explore_source_code."""
     return (
-        item.get("type") == FUNCTION_CALL_TYPE
-        and str(item.get("name") or "") == EXPLORE_TOOL_NAME
+        item.get("type") == FUNCTION_CALL_TYPE and str(item.get("name") or "") == EXPLORE_TOOL_NAME
     )
+
+
+def is_explore_anthropic_call(item: dict) -> bool:
+    """True for Anthropic tool_use named explore_source_code."""
+    return item.get("type") == TOOL_USE_TYPE and str(item.get("name") or "") == EXPLORE_TOOL_NAME
 
 
 def truncate(text: str, max_chars: int) -> str:
@@ -254,6 +267,36 @@ def append_explore_source_code_tool(tools: list) -> list:
     return [*tools, dict(EXPLORE_SOURCE_CODE_TOOL)]
 
 
+def append_explore_source_code_tool_anthropic(tools: list) -> list:
+    """Append Anthropic-shaped explore_source_code tool if not already present."""
+    if not tools:
+        return [dict(EXPLORE_SOURCE_CODE_TOOL_ANTHROPIC)]
+    for tool in tools:
+        if isinstance(tool, dict) and tool.get("name") == EXPLORE_TOOL_NAME:
+            return tools
+    return [*tools, dict(EXPLORE_SOURCE_CODE_TOOL_ANTHROPIC)]
+
+
+def append_explore_instructions_anthropic(system: object) -> object:
+    """Append explore instructions to Anthropic ``system`` (string or blocks)."""
+    if system is None or system == "":
+        return EXPLORE_TOOL_INSTRUCTIONS
+    if isinstance(system, str):
+        if EXPLORE_TOOL_INSTRUCTIONS in system:
+            return system
+        return f"{system.rstrip()}\n\n{EXPLORE_TOOL_INSTRUCTIONS}"
+    if isinstance(system, list):
+        for block in system:
+            if isinstance(block, str) and EXPLORE_TOOL_INSTRUCTIONS in block:
+                return system
+            if isinstance(block, dict) and EXPLORE_TOOL_INSTRUCTIONS in str(
+                block.get("text") or ""
+            ):
+                return system
+        return [*system, {"type": "text", "text": EXPLORE_TOOL_INSTRUCTIONS}]
+    return system
+
+
 def _parse_explore_line(value: object) -> int | None:
     if isinstance(value, bool):
         return None
@@ -381,6 +424,161 @@ def rewrite_explore_call_to_exec(
         "arguments": new_args,
     }
     return rewritten, focus, source
+
+
+def _explore_fields_from_mapping(
+    args: dict,
+    *,
+    max_lines: int = DEFAULT_EXPLORE_MAX_LINES,
+) -> tuple[str, int, int, str | None] | None:
+    """Return clamped (path, start, end, focus) from an explore args mapping."""
+    path = args.get(EXPLORE_PATH_KEY)
+    if not isinstance(path, str) or not path.strip():
+        return None
+    start = _parse_explore_line(args.get(EXPLORE_START_KEY))
+    end = _parse_explore_line(args.get(EXPLORE_END_KEY))
+    if start is None or end is None:
+        return None
+    start, end = clamp_explore_window(start, end, max_lines=max_lines)
+    focus: str | None = None
+    raw_focus = args.get(FOCUS_ARG_KEY)
+    if isinstance(raw_focus, str) and raw_focus.strip():
+        focus = raw_focus.strip()
+    return path.strip(), start, end, focus
+
+
+def rewrite_explore_call_to_read(
+    item: dict,
+    max_chars: int = 300,
+    *,
+    max_lines: int = DEFAULT_EXPLORE_MAX_LINES,
+) -> tuple[dict, str | None, FocusSource]:
+    """Rewrite explore_source_code tool_use to Claude Code Read; return focus.
+
+    Returns the original item unchanged (and focus=None) when args are invalid.
+    """
+    if not is_explore_anthropic_call(item):
+        return item, None, "none"
+
+    raw_input = item.get("input")
+    if not isinstance(raw_input, dict):
+        return item, None, "none"
+
+    fields = _explore_fields_from_mapping(raw_input, max_lines=max_lines)
+    if fields is None:
+        return item, None, "none"
+
+    path, start, end, focus = fields
+    source: FocusSource = "none"
+    if focus:
+        focus = truncate(focus, max_chars)
+        source = "arg"
+
+    rewritten = {
+        **item,
+        "name": READ_TOOL_NAME,
+        "input": {
+            "file_path": path,
+            "offset": start,
+            "limit": end - start + 1,
+        },
+    }
+    return rewritten, focus, source
+
+
+def restore_explore_tool_use(
+    item: dict,
+    *,
+    path: str,
+    focus_question: str | None,
+    start_line: int,
+    end_line: int,
+) -> dict:
+    """Rewrite a client-facing Read tool_use back to explore_source_code."""
+    return {
+        **item,
+        "type": TOOL_USE_TYPE,
+        "name": EXPLORE_TOOL_NAME,
+        "input": {
+            EXPLORE_PATH_KEY: path,
+            FOCUS_ARG_KEY: focus_question or "",
+            EXPLORE_START_KEY: start_line,
+            EXPLORE_END_KEY: end_line,
+        },
+    }
+
+
+def parse_explore_source_fields_anthropic(
+    item: dict,
+) -> tuple[str, int, int, str | None] | None:
+    """Return unclamped (path, start, end, focus) from an Anthropic explore call."""
+    if not is_explore_anthropic_call(item):
+        return None
+    raw_input = item.get("input")
+    if not isinstance(raw_input, dict):
+        return None
+    path = raw_input.get(EXPLORE_PATH_KEY)
+    if not isinstance(path, str) or not path.strip():
+        return None
+    start = _parse_explore_line(raw_input.get(EXPLORE_START_KEY))
+    end = _parse_explore_line(raw_input.get(EXPLORE_END_KEY))
+    if start is None or end is None:
+        return None
+    focus: str | None = None
+    raw_focus = raw_input.get(FOCUS_ARG_KEY)
+    if isinstance(raw_focus, str) and raw_focus.strip():
+        focus = raw_focus.strip()
+    return path.strip(), start, end, focus
+
+
+def aggregate_tool_result_text(item: dict) -> str:
+    """Join Anthropic tool_result content (string or text-block list)."""
+    raw = item.get("content")
+    if isinstance(raw, str):
+        return raw
+    if not isinstance(raw, list):
+        return ""
+    parts: list[str] = []
+    for chunk in raw:
+        if isinstance(chunk, str):
+            parts.append(chunk)
+            continue
+        if not isinstance(chunk, dict):
+            continue
+        text = chunk.get("text")
+        if isinstance(text, str) and text:
+            parts.append(text)
+    return "".join(parts)
+
+
+def rewrite_pruned_tool_result(item: dict, pruned: str) -> dict:
+    """Replace tool_result content with pruned text; keep tool_use_id."""
+    new_item = dict(item)
+    content = item.get("content")
+    if isinstance(content, list) and content:
+        new_chunks: list = []
+        wrote = False
+        for chunk in content:
+            if not isinstance(chunk, dict):
+                new_chunks.append(chunk)
+                continue
+            new_chunk = dict(chunk)
+            if not wrote and new_chunk.get("type") in (None, "text"):
+                new_chunk["type"] = "text"
+                new_chunk["text"] = pruned
+                wrote = True
+            elif "text" in new_chunk and not wrote:
+                new_chunk["text"] = pruned
+                wrote = True
+            elif "text" in new_chunk:
+                new_chunk["text"] = ""
+            new_chunks.append(new_chunk)
+        if not wrote:
+            new_chunks.insert(0, {"type": "text", "text": pruned})
+        new_item["content"] = new_chunks
+        return new_item
+    new_item["content"] = pruned
+    return new_item
 
 
 def aggregate_output_text(item: dict) -> str:

@@ -225,6 +225,33 @@ def _looks_like_sse_response(response: httpx.Response) -> bool:
     return head.startswith(b"event:") or head.startswith(b"data:")
 
 
+async def _explore_prepare_and_prune_anthropic(
+    service: Any,
+    body: dict[str, Any],
+    *,
+    session_key: str,
+    request_id: str,
+    count_text: Any = None,
+) -> Any:
+    """Inject explore tool + prune inbound Anthropic tool_result blocks.
+
+    Fail-open: exceptions are logged and an empty report is returned.
+    """
+    from headroom.proxy.explore_pruner.types import PruneSavings
+
+    empty = PruneSavings()
+    if service is None or not isinstance(body, dict):
+        return empty
+    try:
+        service.prepare_request_anthropic(body)
+        return await service.prune_inbound_anthropic(
+            body, session_key=session_key, count_text=count_text
+        )
+    except Exception:
+        logger.exception("[%s] explore_pruner anthropic prepare/prune failed", request_id)
+        return empty
+
+
 class AnthropicHandlerMixin:
     """Mixin providing Anthropic API handler methods for HeadroomProxy."""
 
@@ -1498,6 +1525,47 @@ class AnthropicHandlerMixin:
             # Pre-strict-override tracker truth: >0 only when a provider cache
             # prefix was actually confirmed (or restored) for this session.
             tracker_frozen_count = frozen_message_count
+
+            from headroom.proxy.explore_pruner.focus import PRUNED_CALL_IDS_KEY
+            from headroom.proxy.explore_pruner.stream_rewrite import (
+                resolve_explore_session_key,
+            )
+            from headroom.proxy.explore_pruner.types import PruneSavings
+
+            explore_svc = getattr(self, "explore_tool_service", None)
+            _session_key_fn = getattr(self, "_get_session_key", None)
+            _explore_fallback = (
+                _session_key_fn(
+                    body,
+                    session_header=request.headers.get("x-headroom-session-id"),
+                )
+                if callable(_session_key_fn)
+                else session_id
+            )
+            explore_session = resolve_explore_session_key(
+                headers=request.headers,
+                body=body if isinstance(body, dict) else None,
+                request_id=_explore_fallback,
+            )
+            explore_report = PruneSavings()
+            if explore_svc is not None and not _bypass:
+                try:
+                    count_text = self.anthropic_provider.get_token_counter(
+                        str(model or "")
+                    ).count_text
+                except Exception:
+                    count_text = None
+                explore_report = await _explore_prepare_and_prune_anthropic(
+                    explore_svc,
+                    body,
+                    session_key=explore_session,
+                    request_id=request_id,
+                    count_text=count_text,
+                )
+                messages = body.get("messages", messages)
+                optimized_messages = messages
+                body_mutation_tracker.mark_mutated("explore_pruner")
+
             # Idle gap since the previous turn's response, snapshotted at fetch
             # (before get_or_create bumped the access clock). Forwarded to the
             # pipeline so the net-cost/TTL gate (HEADROOM_NET_COST_POLICY=1) can
@@ -2152,6 +2220,21 @@ class AnthropicHandlerMixin:
 
             tokens_saved = max(0, original_tokens - optimized_tokens)
             optimization_latency = (time.time() - start_time) * 1000
+
+            # original_tokens was counted before explore prune, so the headline
+            # delta already includes prune savings. Attribute the source without
+            # adding the delta a second time.
+            from headroom.proxy.explore_pruner.savings import apply_explore_prune_savings
+
+            apply_explore_prune_savings(
+                explore_report,
+                tokens_saved=0,
+                attempted_input_tokens=0,
+                original_tokens=0,
+                transforms=transforms_applied,
+                tags=tags,
+                metrics=getattr(self, "metrics", None),
+            )
 
             routing_markers = summarize_routing_markers(transforms_applied)
             if routing_markers:
@@ -3218,6 +3301,9 @@ class AnthropicHandlerMixin:
                     request_id,
                 )
 
+            # Internal-only marker for ContentRouter skip; never forward upstream.
+            body.pop(PRUNED_CALL_IDS_KEY, None)
+
             # Byte-faithful forwarder support (PR-A3, fixes P0-2). At this
             # point body has been through every transform (image, compression,
             # memory, tool sort, pipeline extensions). If a transform reported
@@ -3990,6 +4076,24 @@ class AnthropicHandlerMixin:
                         resp_json = None
                         try:
                             resp_json = response.json()
+                            if (
+                                explore_svc is not None
+                                and response.status_code == 200
+                                and isinstance(resp_json, dict)
+                                and isinstance(resp_json.get("content"), list)
+                            ):
+                                rewritten_content = explore_svc.rewrite_outbound_blocks(
+                                    resp_json["content"],
+                                    session_key=explore_session,
+                                )
+                                if rewritten_content is not resp_json["content"]:
+                                    resp_json = {**resp_json, "content": rewritten_content}
+                                    response = httpx.Response(
+                                        status_code=response.status_code,
+                                        headers=response.headers,
+                                        content=json.dumps(resp_json).encode(),
+                                        request=response.request,
+                                    )
                             if buffered_stream_ccr and response.status_code == 200 and resp_json:
                                 # Remember the upstream's own answer before any
                                 # post-processing touches it. Everything from here
