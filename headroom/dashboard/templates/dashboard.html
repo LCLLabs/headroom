@@ -1326,6 +1326,82 @@
                     <section class="bg-surface rounded-lg p-4 border border-border"><h3 class="mb-3 text-sm text-gray-300">Stacks</h3><template x-for="[name, count] in Object.entries(lifetimeStats.requests?.by_stack || {})" :key="name"><div class="flex justify-between text-sm"><span x-text="name"></span><span x-text="formatNumber(count)"></span></div></template></section>
                     <section class="bg-surface rounded-lg p-4 border border-border"><h3 class="mb-3 text-sm text-gray-300">Top Models + Other</h3><template x-for="[name, metric] in Object.entries(lifetimeStats.by_model || {})" :key="name"><div class="flex justify-between text-sm"><span class="truncate pr-3" x-text="name"></span><span x-text="formatNumber(metric.input_tokens + metric.output_tokens)"></span></div></template></section>
                 </div>
+                <!-- Persistent per-API-key compression breakdown.  Identifiers
+                     are irreversible SHA-256 prefixes; raw credentials never
+                     enter the stats payload or persisted metrics file. -->
+                <section class="bg-surface rounded-lg border border-border overflow-hidden mt-6">
+                    <div class="px-4 py-3 border-b border-border flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
+                        <div>
+                            <span class="text-sm font-medium text-gray-300">API Key Compression</span>
+                            <div class="text-xs text-gray-500 mt-0.5">Persistent lifetime totals — keys shown as irreversible SHA-256 fingerprints</div>
+                        </div>
+                        <div class="text-xs text-gray-500 font-mono">
+                            <span x-text="formatNumber(lifetimeStats.api_keys?.coverage?.attributed_requests || 0) + ' attributed'"></span>
+                            <span class="mx-1 text-gray-700">/</span>
+                            <span x-text="formatNumber(lifetimeStats.api_keys?.coverage?.unattributed_requests || 0) + ' unattributed'"></span>
+                        </div>
+                    </div>
+
+                    <template x-if="Object.keys(lifetimeStats.api_keys?.keys || {}).length === 0">
+                        <div class="px-4 py-8 text-center text-sm text-gray-500">
+                            API-key rows appear after a request carrying <span class="font-mono">Authorization</span>,
+                            <span class="font-mono">x-api-key</span>, <span class="font-mono">api-key</span>, or
+                            <span class="font-mono">x-goog-api-key</span> completes through the proxy.
+                        </div>
+                    </template>
+
+                    <template x-if="Object.keys(lifetimeStats.api_keys?.keys || {}).length > 0">
+                        <div class="overflow-x-auto">
+                            <table class="w-full text-sm" style="table-layout:fixed">
+                                <colgroup>
+                                    <col style="width:21%">
+                                    <col style="width:9%">
+                                    <col style="width:12%">
+                                    <col style="width:12%">
+                                    <col style="width:12%">
+                                    <col style="width:14%">
+                                    <col style="width:20%">
+                                </colgroup>
+                                <thead class="text-xs text-gray-500 tracking-wide">
+                                    <tr>
+                                        <th class="px-4 py-3 font-medium text-left">API Key ID</th>
+                                        <th class="px-4 py-3 font-medium text-right">Requests</th>
+                                        <th class="px-4 py-3 font-medium text-right">Before</th>
+                                        <th class="px-4 py-3 font-medium text-right">After</th>
+                                        <th class="px-4 py-3 font-medium text-right">Saved</th>
+                                        <th class="px-4 py-3 font-medium text-right">Savings</th>
+                                        <th class="px-4 py-3 font-medium text-right">Last Active</th>
+                                    </tr>
+                                </thead>
+                                <tbody class="divide-y divide-border">
+                                    <template x-for="[apiKeyId, info] in Object.entries(lifetimeStats.api_keys?.keys || {})" :key="apiKeyId">
+                                        <tr class="hover:bg-border/30 transition-colors">
+                                            <td class="px-4 py-3 text-left">
+                                                <span class="px-2 py-0.5 bg-border text-xs font-mono text-cyan-300" x-text="apiKeyId"></span>
+                                            </td>
+                                            <td class="px-4 py-3 text-right font-mono tabular-nums" x-text="formatNumber(info.requests || 0)"></td>
+                                            <td class="px-4 py-3 text-right font-mono tabular-nums" x-text="formatNumber(info.before_tokens || 0)"></td>
+                                            <td class="px-4 py-3 text-right font-mono tabular-nums" x-text="formatNumber(info.after_tokens || 0)"></td>
+                                            <td class="px-4 py-3 text-right font-mono tabular-nums text-accent" x-text="formatNumber(info.tokens_saved || 0)"></td>
+                                            <td class="px-4 py-3 text-right">
+                                                <div class="flex items-center justify-end gap-2">
+                                                    <div class="w-16 h-1.5 bg-border rounded-full overflow-hidden">
+                                                        <div class="h-full bg-emerald-500 rounded-full"
+                                                             :style="'width:' + Math.min(info.savings_percent || 0, 100) + '%'"></div>
+                                                    </div>
+                                                    <span class="text-emerald-400 font-mono tabular-nums text-xs w-12 text-right"
+                                                          x-text="info.savings_percent == null ? '—' : info.savings_percent.toFixed(1) + '%'"></span>
+                                                </div>
+                                            </td>
+                                            <td class="px-4 py-3 text-right text-xs text-gray-500 font-mono"
+                                                x-text="info.last_activity_at ? new Date(info.last_activity_at).toLocaleString() : '—'"></td>
+                                        </tr>
+                                    </template>
+                                </tbody>
+                            </table>
+                        </div>
+                    </template>
+                </section>
                 <!-- Per-Project Savings Breakdown -->
                 <section class="bg-surface rounded-lg border border-border overflow-hidden mt-6">
                     <div class="px-4 py-3 border-b border-border flex justify-between items-center">

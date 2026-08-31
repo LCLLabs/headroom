@@ -13,6 +13,8 @@ MAX_PROVIDER_VALUES = 32
 MAX_STACK_VALUES = 64
 MAX_TRACKED_MODELS = 200
 MAX_EXPOSED_MODELS = 100
+MAX_TRACKED_API_KEYS = 500
+MAX_EXPOSED_API_KEYS = 100
 MAX_LABEL_LENGTH = 128
 
 KNOWN_MISS_REASONS = frozenset({"ttl_expiry", "prefix_change", "unknown"})
@@ -78,6 +80,23 @@ def _model_entry(raw: Any = None) -> dict[str, Any]:
     }
 
 
+def _api_key_entry(raw: Any = None) -> dict[str, Any]:
+    raw = raw if isinstance(raw, dict) else {}
+    return {
+        "requests": _coerce_int(raw.get("requests")),
+        # Local post-compression count.  This intentionally does not use the
+        # provider-billed count because ``tokens_saved`` is measured locally;
+        # mixing tokenizers would corrupt the compression ratio.
+        "input_tokens": _coerce_int(raw.get("input_tokens")),
+        "output_tokens": _coerce_int(raw.get("output_tokens")),
+        "attempted_input_tokens": _coerce_int(raw.get("attempted_input_tokens")),
+        "tokens_saved": _coerce_int(raw.get("tokens_saved")),
+        "last_activity_at": raw.get("last_activity_at")
+        if isinstance(raw.get("last_activity_at"), str)
+        else None,
+    }
+
+
 def _empty_state() -> dict[str, Any]:
     return {
         "started_at": None,
@@ -108,6 +127,11 @@ def _empty_state() -> dict[str, Any]:
         "cost": {"input_usd": 0.0, "compression_savings_usd": 0.0, "cache_savings_usd": 0.0},
         "waste_signals": {},
         "models": {"tracked": {}, "other": _model_entry()},
+        "api_keys": {
+            "tracked": {},
+            "other": _api_key_entry(),
+            "unattributed_requests": 0,
+        },
         "persistence": {"last_saved_at": None},
     }
 
@@ -128,6 +152,7 @@ class PersistentMetricsState:
         self._now = now
         self._state = self._normalize(raw)
         self._compact_models()
+        self._compact_api_keys()
 
     def _normalize(self, raw: dict[str, Any] | None) -> dict[str, Any]:
         source = raw if isinstance(raw, dict) else {}
@@ -187,6 +212,21 @@ class PersistentMetricsState:
                 continue
             result["models"]["tracked"][normalized_name] = _model_entry(entry)
         self._merge_model_entry(result["models"]["other"], _model_entry(raw_models.get("other")))
+
+        raw_api_keys = _dict_or_empty(source.get("api_keys"))
+        raw_tracked_api_keys = _dict_or_empty(raw_api_keys.get("tracked"))
+        for api_key_id, entry in raw_tracked_api_keys.items():
+            normalized_id = self._api_key_name(api_key_id)
+            if normalized_id == "other":
+                self._merge_api_key_entry(result["api_keys"]["other"], _api_key_entry(entry))
+                continue
+            result["api_keys"]["tracked"][normalized_id] = _api_key_entry(entry)
+        self._merge_api_key_entry(
+            result["api_keys"]["other"], _api_key_entry(raw_api_keys.get("other"))
+        )
+        result["api_keys"]["unattributed_requests"] = _coerce_int(
+            raw_api_keys.get("unattributed_requests")
+        )
         raw_persistence = _dict_or_empty(source.get("persistence"))
         if isinstance(raw_persistence.get("last_saved_at"), str):
             result["persistence"]["last_saved_at"] = raw_persistence["last_saved_at"]
@@ -275,6 +315,82 @@ class PersistentMetricsState:
             self._merge_model_entry(other, entry)
         self._state["models"]["tracked"] = kept
 
+    @staticmethod
+    def _api_key_name(value: Any) -> str:
+        """Accept only fingerprints produced by ``api_key_stats``."""
+
+        if not isinstance(value, str) or not value.startswith("key_"):
+            return "other"
+        digest = value[4:]
+        if len(digest) != 16:
+            return "other"
+        try:
+            int(digest, 16)
+        except ValueError:
+            return "other"
+        return value
+
+    @staticmethod
+    def _merge_api_key_entry(destination: dict[str, Any], source: dict[str, Any]) -> None:
+        for key in (
+            "requests",
+            "input_tokens",
+            "output_tokens",
+            "attempted_input_tokens",
+            "tokens_saved",
+        ):
+            destination[key] += _coerce_int(source.get(key))
+        if destination["last_activity_at"] is None or (
+            source["last_activity_at"] is not None
+            and source["last_activity_at"] > destination["last_activity_at"]
+        ):
+            destination["last_activity_at"] = source["last_activity_at"]
+
+    @staticmethod
+    def _api_key_rank(item: tuple[str, dict[str, Any]]) -> tuple[int, str, str]:
+        name, entry = item
+        before_tokens = entry["input_tokens"] + entry["tokens_saved"]
+        return (-before_tokens, entry["last_activity_at"] or "", name)
+
+    def _compact_api_keys(self) -> None:
+        tracked = self._state["api_keys"]["tracked"]
+        if len(tracked) <= MAX_TRACKED_API_KEYS:
+            return
+        ranked = sorted(tracked.items(), key=self._api_key_rank)
+        kept = dict(ranked[:MAX_EXPOSED_API_KEYS])
+        other = self._state["api_keys"]["other"]
+        for _, entry in ranked[MAX_EXPOSED_API_KEYS:]:
+            self._merge_api_key_entry(other, entry)
+        self._state["api_keys"]["tracked"] = kept
+
+    def _record_api_key(
+        self,
+        *,
+        api_key_id: str | None,
+        timestamp: str,
+        input_tokens: int,
+        output_tokens: int,
+        attempted_input_tokens: int,
+        tokens_saved: int,
+    ) -> None:
+        name = self._api_key_name(api_key_id)
+        api_keys = self._state["api_keys"]
+        if api_key_id is None:
+            api_keys["unattributed_requests"] += 1
+            return
+        entry = (
+            api_keys["other"]
+            if name == "other"
+            else api_keys["tracked"].setdefault(name, _api_key_entry())
+        )
+        entry["requests"] += 1
+        entry["input_tokens"] += input_tokens
+        entry["output_tokens"] += output_tokens
+        entry["attempted_input_tokens"] += attempted_input_tokens
+        entry["tokens_saved"] += tokens_saved
+        entry["last_activity_at"] = timestamp
+        self._compact_api_keys()
+
     def _record_model(
         self,
         *,
@@ -321,6 +437,8 @@ class PersistentMetricsState:
         compression_savings_usd: Any = 0.0,
         cache_savings_usd: Any = 0.0,
         waste_signals: dict[str, Any] | None = None,
+        api_key_id: str | None = None,
+        api_key_input_tokens: Any | None = None,
     ) -> None:
         """Accumulate one completed top-level request after coercing all deltas."""
 
@@ -329,6 +447,9 @@ class PersistentMetricsState:
         output_delta = _coerce_int(output_tokens)
         attempted_delta = _coerce_int(attempted_input_tokens)
         saved_delta = _coerce_int(tokens_saved)
+        api_key_input_delta = _coerce_int(
+            input_tokens if api_key_input_tokens is None else api_key_input_tokens
+        )
         provider_label = _label(provider)
         stack_label = _label(stack)
 
@@ -375,6 +496,14 @@ class PersistentMetricsState:
             model=model,
             timestamp=timestamp,
             input_tokens=input_delta,
+            output_tokens=output_delta,
+            attempted_input_tokens=attempted_delta,
+            tokens_saved=saved_delta,
+        )
+        self._record_api_key(
+            api_key_id=api_key_id,
+            timestamp=timestamp,
+            input_tokens=api_key_input_delta,
             output_tokens=output_delta,
             attempted_input_tokens=attempted_delta,
             tokens_saved=saved_delta,
@@ -436,6 +565,39 @@ class PersistentMetricsState:
         result["other"] = other
         return result
 
+    def _api_key_snapshot(self) -> dict[str, Any]:
+        ranked = sorted(self._state["api_keys"]["tracked"].items(), key=self._api_key_rank)
+        visible = ranked[:MAX_EXPOSED_API_KEYS]
+        other = _api_key_entry(self._state["api_keys"]["other"])
+        for _, entry in ranked[MAX_EXPOSED_API_KEYS:]:
+            self._merge_api_key_entry(other, entry)
+
+        rows: dict[str, dict[str, Any]] = {}
+        for name, entry in visible:
+            row = deepcopy(entry)
+            before_tokens = row["input_tokens"] + row["tokens_saved"]
+            row["before_tokens"] = before_tokens
+            row["after_tokens"] = row["input_tokens"]
+            row["savings_percent"] = self._percent(row["tokens_saved"], before_tokens)
+            rows[name] = row
+        if other["requests"] > 0:
+            before_tokens = other["input_tokens"] + other["tokens_saved"]
+            other["before_tokens"] = before_tokens
+            other["after_tokens"] = other["input_tokens"]
+            other["savings_percent"] = self._percent(other["tokens_saved"], before_tokens)
+            rows["other"] = other
+
+        attributed_requests = sum(int(row["requests"]) for row in rows.values())
+        return {
+            "keys": rows,
+            "coverage": {
+                "tracked_keys": len(visible),
+                "attributed_requests": attributed_requests,
+                "unattributed_requests": self._state["api_keys"]["unattributed_requests"],
+            },
+            "privacy": "sha256-prefix-16",
+        }
+
     def snapshot(self, *, persistence: dict[str, Any]) -> dict[str, Any]:
         """Return an API-safe aggregate and derive all percentages at read time."""
 
@@ -463,6 +625,7 @@ class PersistentMetricsState:
             "cost": deepcopy(self._state["cost"]),
             "waste_signals": deepcopy(self._state["waste_signals"]),
             "by_model": self._by_model_snapshot(),
+            "api_keys": self._api_key_snapshot(),
             "persistence": {
                 **deepcopy(persistence),
                 "last_saved_at": self._state["persistence"]["last_saved_at"],

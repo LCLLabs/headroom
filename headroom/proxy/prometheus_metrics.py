@@ -755,6 +755,7 @@ class PrometheusMetrics:
         tool_search_saved: int = 0,
         local_input_tokens: int | None = None,
         savings_attribution: list[dict[str, Any]] | None = None,
+        api_key_id: str | None = None,
     ):
         """Record metrics for a request.
 
@@ -929,6 +930,8 @@ class PrometheusMetrics:
                 cache_write_1h_tokens=cache_write_1h_tokens,
                 uncached_input_tokens=uncached_input_tokens,
                 waste_signals=waste_signals,
+                api_key_id=api_key_id,
+                api_key_input_tokens=ledger_input_tokens,
             )
             total_input_tokens, total_input_cost_usd = self._current_savings_tracker_totals()
             self.savings_tracker.record_request(

@@ -397,6 +397,7 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
     if/when another contract surface emerges, but YAGNI.
     """
     from headroom.copilot_auth import consume_request_routed_to_copilot
+    from headroom.proxy.api_key_stats import api_key_id_from_tags
     from headroom.proxy.cost import _summarize_transforms
     from headroom.proxy.models import RequestLog
     from headroom.proxy.project_context import get_current_project
@@ -529,6 +530,7 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
         tool_search_saved=tool_search_saved,
         local_input_tokens=outcome.optimized_tokens,
         savings_attribution=savings_breakdown,
+        api_key_id=api_key_id_from_tags(outcome.tags),
     )
 
     # 2. Cost tracker (optional).
