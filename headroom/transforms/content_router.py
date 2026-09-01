@@ -609,6 +609,126 @@ def _strip_cd_prefix(command: str) -> str:
     return c
 
 
+_PIPE_READ_BOUNDARIES = frozenset({"head", "tail"})
+_FILE_FILTER_PROGS = frozenset(
+    {"grep", "egrep", "fgrep", "rg", "ripgrep", "ag", "ack"}
+)
+
+
+def _split_pipe_segments(command: str) -> list[str]:
+    """Split a shell command on ``|`` outside single/double quotes.
+
+    Agent shell commands often pipe a filter into a limiter, e.g.
+    ``grep -n "pat" file.go | head -60``.  We need the first and last
+    segments separately to classify that as a bounded file read.  A naive
+    ``command.split("|")`` is wrong when the grep pattern itself contains
+    ``|`` (``"IndexExpression|evalIndexExpression"``) — those pipes must
+    stay inside the first segment.
+
+    This is a lightweight quote-aware scan, not a full shell parser: it
+    handles the common agent shapes (single/double-quoted patterns) and
+    ignores backslash escapes inside quotes.  A mis-parse only makes a
+    read/search classification miss; downstream reversibility guards keep
+    compression safe.
+    """
+    # Completed pipe stages, e.g. ["grep -n pat file.go", "head -60"].
+    segments: list[str] = []
+    # Characters accumulated for the segment currently being scanned.
+    buf: list[str] = []
+    # When set, we are inside a quoted string and ``|`` must not split.
+    quote: str | None = None
+    i = 0
+    n = len(command)
+    while i < n:
+        ch = command[i]
+        if quote:
+            # Inside quotes: copy every char verbatim, including ``|``.
+            buf.append(ch)
+            if ch == quote:
+                quote = None  # closing quote — resume normal scanning
+            i += 1
+            continue
+        if ch in ("'", '"'):
+            quote = ch  # opening quote — delimiter itself is kept in buf
+            buf.append(ch)
+            i += 1
+            continue
+        if ch == "|":
+            # Unquoted pipe: flush the stage built so far and start the next.
+            segment = "".join(buf).strip()
+            if segment:
+                segments.append(segment)
+            buf = []
+            i += 1
+            continue
+        buf.append(ch)
+        i += 1
+    # No trailing pipe — flush the final stage.
+    segment = "".join(buf).strip()
+    if segment:
+        segments.append(segment)
+    return segments
+
+
+def _last_path_operand(tokens: list[str]) -> str:
+    """Return the last non-flag token from a shell argv slice.
+
+    Used by ``_is_file_targeted_filter`` to recover the *file path* from a
+    grep/sed/rg stage after ``_bash_program`` has peeled wrappers.  In agent
+    commands the path is almost always the final positional argument::
+
+        grep -n "pat" evaluator/evaluator.go  ->  evaluator/evaluator.go
+        rg -n pattern src/foo.go             ->  src/foo.go
+
+    Flags (``-n``, ``-i``, …) and their values (``-e PATTERN``) are skipped;
+    only the last remaining token is returned.  Whitespace-split only — quoted
+    patterns with spaces are already one token when passed in from
+    ``_bash_program``'s rest slice.
+    """
+    if not tokens:
+        return ""
+    # Walk left-to-right; the last positional token wins (typical grep layout).
+    operand = ""
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        if tok.startswith("-"):
+            # Skip the flag and, for options that take a value, skip that too.
+            if tok in ("-e", "-f", "--file", "-m", "--max-count") and i + 1 < len(tokens):
+                i += 2
+                continue
+            i += 1
+            continue
+        # Positional token — overwrite so the final one is kept.
+        operand = tok.strip("'\"")
+        i += 1
+    return operand
+
+
+def _is_file_targeted_filter(segment: str) -> bool:
+    """True when ``segment`` is grep/sed/rg against a single file, not a tree search."""
+    prog, rest = _bash_program(segment)
+    if prog == "sed":
+        return bool(re.search(r"(^|\s)-n(\s|$)", segment))
+    if prog not in _FILE_FILTER_PROGS:
+        return False
+    if re.search(r"(^|\s)-[rR]\b|(^|\s)--recursive\b", segment):
+        return False
+    path = _last_path_operand(rest)
+    return bool(path) and path != "." and ("/" in path or "." in path)
+
+
+def _is_bounded_file_filter_read(command: str) -> bool:
+    """True for ``grep/sed/rg <file> | head/tail`` — a bounded file slice read."""
+    segments = _split_pipe_segments(_strip_cd_prefix(command))
+    if len(segments) < 2:
+        return False
+    last_prog, _ = _bash_program(segments[-1])
+    if last_prog not in _PIPE_READ_BOUNDARIES:
+        return False
+    return _is_file_targeted_filter(segments[0])
+
+
 def _is_read_command(command: str) -> bool:
     """True when a shell command's output is essentially raw FILE CONTENT the agent
     will read/edit from — ``cat``/``head``/``tail``/``nl``/``less``/``more`` of a file,
@@ -656,7 +776,7 @@ def _is_read_command(command: str) -> bool:
         # `sed -n '1,20p' file` prints a range (read); bare `sed` is a stream editor.
         prog == "sed" and bool(re.search(r"(^|\s)-n(\s|$)", c))
     )
-    if not is_read:
+    if not is_read and not _is_bounded_file_filter_read(c):
         return False
     # Lockfiles are tool-regenerated, not byte-patched — never protect (keep compressible).
     return not _LOCKFILE_RE.search(c)
@@ -716,6 +836,8 @@ def _bash_command_is_search(command: str, search_commands: frozenset[str]) -> bo
     # Peel `cd <dir> && ` chains first — harnesses prefix every command with a
     # cd, so without this the parsed program is `cd` and the fold never fires.
     command = _strip_cd_prefix(command)
+    if _is_bounded_file_filter_read(command):
+        return False
     prog, rest = _bash_program(command)
     if not prog:
         return False
@@ -1047,7 +1169,7 @@ _RELEASABLE_READ_TYPES = frozenset(
 )
 
 
-def _read_output_should_be_protected(text: Any) -> bool:
+def _read_output_should_be_protected(text: Any, *, command: str = "") -> bool:
     """Finalize read-protection by CONTENT — protect by default, release only DATA.
 
     ``_is_read_command`` says "this came from a cat/sed/head file read (and isn't a
@@ -1059,9 +1181,15 @@ def _read_output_should_be_protected(text: Any) -> bool:
     diff, HTML, search output), which are never byte-patched and route to a compressor.
     JSON objects are now recognized by the content detector's real parse, so no
     separate object carve-out is needed here.
+
+    Bounded file-filter reads (``grep file | head``) emit ``file:line:content`` rows
+    that detect as SEARCH_RESULTS; pass the originating command so those reads stay
+    protected even when the content gate would otherwise release them.
     """
     if not isinstance(text, str) or not text:
         return False
+    if command and _is_bounded_file_filter_read(command):
+        return True
     try:
         return _detect_content(text).content_type not in _RELEASABLE_READ_TYPES
     except Exception:
@@ -4835,6 +4963,7 @@ class ContentRouter(Transform):
         # cat/sed/head code reads are protected on ANY model/harness, not just
         # those that emit tool-call/tool_result blocks.
         self._protect_read_msg_indices: set[int] = set()
+        self._protect_read_msg_commands: dict[int, str] = {}
         if os.environ.get("HEADROOM_PROTECT_READS", "0").strip().lower() not in (
             "0",
             "",
@@ -4854,6 +4983,7 @@ class ContentRouter(Transform):
                         break
                 if _cmd and _is_read_command(_cmd):
                     self._protect_read_msg_indices.add(_idx)
+                    self._protect_read_msg_commands[_idx] = _cmd
 
         # --- Adaptive parameters based on context pressure ---
         num_messages = len(messages)
@@ -5173,7 +5303,10 @@ class ContentRouter(Transform):
                 _is_read_obs = _tcid in getattr(self, "_protect_read_tool_ids", ()) or i in getattr(
                     self, "_protect_read_msg_indices", ()
                 )
-                if _is_read_obs and _read_output_should_be_protected(content):
+                _read_cmd = self._tool_call_commands.get(_tcid, "")
+                if not _read_cmd:
+                    _read_cmd = getattr(self, "_protect_read_msg_commands", {}).get(i, "")
+                if _is_read_obs and _read_output_should_be_protected(content, command=_read_cmd):
                     _exp = self._experimental_compress_read(content, context)
                     if _exp is not None:
                         result_slots[i] = {**message, "content": _exp}
@@ -6031,9 +6164,10 @@ class ContentRouter(Transform):
                 # log/lockfile/text) is not byte-patched, so it falls through to its
                 # content-specific compressor. Cross-turn dedup still runs later, so
                 # re-reads of the same file are losslessly de-duplicated either way.
+                _read_cmd = self._tool_call_commands.get(tool_use_id, "")
                 if tool_use_id in getattr(
                     self, "_protect_read_tool_ids", ()
-                ) and _read_output_should_be_protected(_tr_text):
+                ) and _read_output_should_be_protected(_tr_text, command=_read_cmd):
                     _exp = self._experimental_compress_read(_tr_text, context or "")
                     if _exp is not None:
                         new_blocks.append({**block, "content": _exp})
