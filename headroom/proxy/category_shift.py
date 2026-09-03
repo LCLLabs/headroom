@@ -53,6 +53,21 @@ def _detect_content_type(text: str) -> str:
     return result.content_type.value
 
 
+def _dominant_type(types: list[str], texts: list[str]) -> str:
+    """Pick the one content type that represents a whole request.
+
+    Units are weighted by text length rather than counted: a request holding a
+    single large code block plus a handful of short prose lines is a code
+    request. Ties break on type name so the result stays deterministic.
+    """
+    if not types:
+        return ContentType.UNKNOWN.value
+    weights: Counter[str] = Counter()
+    for idx, content_type in enumerate(types):
+        weights[content_type] += len(texts[idx]) if idx < len(texts) else 0
+    return max(sorted(weights), key=lambda content_type: weights[content_type])
+
+
 def _family_from_transforms(transforms_applied: Iterable[str] | None) -> str:
     labels = " ".join(str(item).lower() for item in (transforms_applied or []))
     if "coact" in labels:
@@ -70,6 +85,9 @@ class CategoryShiftObservation:
     request_changed: bool
     unit_count: int
     changed_units: int
+    # Request-level category: the dominant type on each side of compression.
+    before_type: str = ContentType.UNKNOWN.value
+    after_type: str = ContentType.UNKNOWN.value
     before_counts: dict[str, int] = field(default_factory=dict)
     after_counts: dict[str, int] = field(default_factory=dict)
     transitions: dict[str, int] = field(default_factory=dict)
@@ -90,6 +108,9 @@ class CategoryShiftStats:
     before_counts: Counter[str] = field(default_factory=Counter)
     after_counts: Counter[str] = field(default_factory=Counter)
     transitions: Counter[str] = field(default_factory=Counter)
+    # Request totals per category, counted once per request instead of per unit.
+    request_before_counts: Counter[str] = field(default_factory=Counter)
+    request_after_counts: Counter[str] = field(default_factory=Counter)
 
     def record(self, obs: CategoryShiftObservation) -> None:
         self.requests_analyzed += 1
@@ -100,6 +121,8 @@ class CategoryShiftStats:
         self.before_counts.update(obs.before_counts)
         self.after_counts.update(obs.after_counts)
         self.transitions.update(obs.transitions)
+        self.request_before_counts[obs.before_type] += 1
+        self.request_after_counts[obs.after_type] += 1
 
     def snapshot(self) -> dict[str, Any]:
         return {
@@ -116,7 +139,32 @@ class CategoryShiftStats:
             "before_counts": dict(self.before_counts),
             "after_counts": dict(self.after_counts),
             "transitions": dict(self.transitions),
+            "request_before_counts": dict(self.request_before_counts),
+            "request_after_counts": dict(self.request_after_counts),
+            "request_type_totals": self._request_type_totals(),
         }
+
+    def _request_type_totals(self) -> list[dict[str, Any]]:
+        """Per-category request totals, pre- vs post-compression.
+
+        Every ContentType gets a row, zeros included, in enum order — the
+        dashboard shows a stable set of rows that never reorder as traffic
+        arrives. Any type outside the enum is appended rather than dropped.
+        """
+        types = [content_type.value for content_type in ContentType]
+        types += sorted(
+            (set(self.request_before_counts) | set(self.request_after_counts)) - set(types)
+        )
+        return [
+            {
+                "type": content_type,
+                "before": self.request_before_counts.get(content_type, 0),
+                "after": self.request_after_counts.get(content_type, 0),
+                "delta": self.request_after_counts.get(content_type, 0)
+                - self.request_before_counts.get(content_type, 0),
+            }
+            for content_type in types
+        ]
 
 
 @dataclass
@@ -173,6 +221,8 @@ def analyze_category_shift(
         request_changed=changed_units > 0,
         unit_count=unit_count,
         changed_units=changed_units,
+        before_type=_dominant_type(before_types, before_texts),
+        after_type=_dominant_type(after_types, after_texts),
         before_counts=dict(before_counts),
         after_counts=dict(after_counts),
         transitions=dict(transitions),
@@ -195,6 +245,8 @@ def serialize_category_shift_record(
         "provider": provider,
         "model": model,
         "family": observation.family,
+        "before_type": observation.before_type,
+        "after_type": observation.after_type,
         "request_changed": observation.request_changed,
         "unit_count": observation.unit_count,
         "changed_units": observation.changed_units,
