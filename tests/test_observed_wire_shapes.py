@@ -304,6 +304,8 @@ def test_read_command_classifier():
         "cat -n foo.py",
         "cd /x && cat a.py",
         "cd /x && cat -A a.py | head -60",
+        'grep -n "IndexExpression|evalIndexExpression" evaluator/evaluator.go | head -60',
+        "rg -n pattern src/foo.go | head -20",
         "sed -n '1,50p' f.py",
         "head -100 f.py",
         "tail -20 log",
@@ -317,6 +319,9 @@ def test_read_command_classifier():
         "sed 's/a/b/' f",
         "rg -l x --type py",
         "grep -rn x .",
+        "grep -n pat . | head -5",
+        "grep -n pat file.go",
+        "grep -n pat file.go | wc -l",
         "ls -la",
         "python -c 'x'",
         "git diff -- f",
@@ -366,6 +371,11 @@ def test_bugA_cd_prefixed_search_detected_all_harnesses():
     # non-search must stay non-search even with a cd prefix
     for cmd in ["cd /x && cat a.py", "cd /x && python -c 'x'", "cd /x && ls -la"]:
         assert not _issearch(cmd, _SEARCH), f"false search: {cmd!r}"
+    for cmd in [
+        'grep -n "pat" evaluator/evaluator.go | head -60',
+        "rg -n pattern src/foo.go | head -20",
+    ]:
+        assert not _issearch(cmd, _SEARCH), f"bounded read misclassified as search: {cmd!r}"
 
 
 def test_bugA_strip_cd_prefix_shapes():
@@ -523,6 +533,14 @@ def test_read_protection_releases_json_object_but_protects_code():
     py = "<returncode>0</returncode>\n<output>\n" + ("def f():\n    x = 1\n" * 60) + "</output>"
     assert _protect(wrapped_obj) is False  # config/data object → RELEASE (compressible)
     assert _protect(py) is True  # source code → PROTECT (byte-exact)
+
+
+def test_bounded_grep_head_read_stays_protected_despite_search_shape():
+    grep_out = "evaluator/evaluator.go:42:func evalIndexExpression()\n" * 50
+    cmd = 'grep -n "IndexExpression" evaluator/evaluator.go | head -60'
+    assert _isread(cmd)
+    assert _protect(grep_out, command=cmd) is True
+    assert _protect(grep_out) is False
 
 
 def test_read_protection_role_agnostic_openai_role_tool():
