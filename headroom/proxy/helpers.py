@@ -885,6 +885,28 @@ def append_text_to_latest_user_chat_message(
 _ROLE_SYSTEM = "system"
 _TEXT_BLOCK_TYPE = "text"
 
+#: Opt-out for the issue-765 wire guard that hoists ``role="system"`` entries
+#: out of ``messages`` into the top-level ``system`` parameter. Compatible
+#: Anthropic gateways (and Claude Code mid-conversation reminders) often accept
+#: system-in-messages; hoisting then shifts message indices and trips the
+#: signed-thinking passthrough, discarding every other body edit. Set to a
+#: falsey value to leave client message layout alone.
+RELOCATE_SYSTEM_MESSAGES_ENV = "HEADROOM_RELOCATE_SYSTEM_MESSAGES"
+
+
+def system_role_relocation_enabled() -> bool:
+    """Whether to hoist stray ``role="system"`` messages to top-level ``system``.
+
+    Defaults to enabled (strict Anthropic wire contract). Only an explicit
+    falsey value disables the guard, so unset/unparseable keeps today's
+    behaviour.
+    """
+    raw = os.environ.get(RELOCATE_SYSTEM_MESSAGES_ENV)
+    if raw is None:
+        return True
+    return raw.strip().lower() not in ("0", "false", "no", "off")
+
+
 
 def _system_message_to_blocks(message: dict[str, Any]) -> list[Any]:
     """Convert a ``role="system"`` message into Anthropic system content blocks."""

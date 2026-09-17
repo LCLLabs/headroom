@@ -21,6 +21,7 @@ from headroom.proxy.handlers.openai import (
 from headroom.proxy.helpers import (
     _headroom_bypass_enabled,
     relocate_system_messages_to_top_level,
+    system_role_relocation_enabled,
 )
 from headroom.proxy.server import HeadroomProxy
 
@@ -402,6 +403,29 @@ def test_relocate_system_messages_moves_valid_shape_for_unsupported_model() -> N
     assert changed is True
     assert clean == [{"role": "user", "content": "question"}]
     assert system == [{"type": "text", "text": "mid-turn instruction"}]
+
+
+def test_system_role_relocation_enabled_defaults_on(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("HEADROOM_RELOCATE_SYSTEM_MESSAGES", raising=False)
+    assert system_role_relocation_enabled() is True
+
+
+@pytest.mark.parametrize("off_value", ("0", "false", "no", "off", "FALSE", " Off "))
+def test_system_role_relocation_enabled_falsey_disables(
+    monkeypatch: pytest.MonkeyPatch, off_value: str
+) -> None:
+    monkeypatch.setenv("HEADROOM_RELOCATE_SYSTEM_MESSAGES", off_value)
+    assert system_role_relocation_enabled() is False
+
+
+@pytest.mark.parametrize("on_value", ("1", "true", "yes", "on", "TRUE"))
+def test_system_role_relocation_enabled_truthy_keeps_on(
+    monkeypatch: pytest.MonkeyPatch, on_value: str
+) -> None:
+    monkeypatch.setenv("HEADROOM_RELOCATE_SYSTEM_MESSAGES", on_value)
+    assert system_role_relocation_enabled() is True
 
 
 def test_headroom_bypass_helper_is_transport_neutral() -> None:

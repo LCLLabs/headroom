@@ -46,6 +46,7 @@ from headroom.proxy.helpers import (
     extract_tags,
     relocate_system_messages_to_top_level,
     sanitize_forwarded_response_headers,
+    system_role_relocation_enabled,
 )
 from headroom.proxy.identity import resolve_memory_identity
 from headroom.proxy.image_isolation import run_image_compression_isolated
@@ -3273,33 +3274,38 @@ class AnthropicHandlerMixin:
             # compression). Anthropic rejects that with a 400 ("messages.0: use
             # the top-level 'system' parameter ..."), so relocate it back to the
             # top-level ``system`` parameter as the last step before forwarding.
-            relocated_messages, relocated_system, system_relocated = (
-                relocate_system_messages_to_top_level(
-                    body["messages"],
-                    body.get("system"),
-                    (
-                        str(model)
-                        if (
-                            not upstream_base_url
-                            or getattr(self, "anthropic_backend", None) is not None
-                            or _is_googleapis_endpoint(upstream_base_url)
-                        )
-                        else None
-                    ),
+            # Opt out with HEADROOM_RELOCATE_SYSTEM_MESSAGES=0 when the upstream
+            # accepts system-in-messages (compatible gateways / Claude Code
+            # mid-turn reminders): hoisting shifts indices and can force the
+            # signed-thinking passthrough to discard every other body edit.
+            if system_role_relocation_enabled():
+                relocated_messages, relocated_system, system_relocated = (
+                    relocate_system_messages_to_top_level(
+                        body["messages"],
+                        body.get("system"),
+                        (
+                            str(model)
+                            if (
+                                not upstream_base_url
+                                or getattr(self, "anthropic_backend", None) is not None
+                                or _is_googleapis_endpoint(upstream_base_url)
+                            )
+                            else None
+                        ),
+                    )
                 )
-            )
-            if system_relocated:
-                body["messages"] = relocated_messages
-                if relocated_system is None:
-                    body.pop("system", None)
-                else:
-                    body["system"] = relocated_system
-                body_mutation_tracker.mark_mutated("system_role_relocated")
-                logger.warning(
-                    "[%s] Relocated role=system message(s) out of messages[] into the "
-                    "top-level system parameter (Anthropic wire-contract guard, issue #765)",
-                    request_id,
-                )
+                if system_relocated:
+                    body["messages"] = relocated_messages
+                    if relocated_system is None:
+                        body.pop("system", None)
+                    else:
+                        body["system"] = relocated_system
+                    body_mutation_tracker.mark_mutated("system_role_relocated")
+                    logger.warning(
+                        "[%s] Relocated role=system message(s) out of messages[] into the "
+                        "top-level system parameter (Anthropic wire-contract guard, issue #765)",
+                        request_id,
+                    )
 
             # Internal-only marker for ContentRouter skip; never forward upstream.
             body.pop(PRUNED_CALL_IDS_KEY, None)
