@@ -337,6 +337,7 @@ DERIVED_WORKSPACE_HELPERS = [
     pytest.param("bridge_state_path", "bridge_state.json", id="bridge_state_path"),
     pytest.param("log_dir", "logs", id="log_dir"),
     pytest.param("debug_400_dir", "logs/debug_400", id="debug_400_dir"),
+    pytest.param("session_delta_log_dir", "logs/sessions", id="session_delta_log_dir"),
     pytest.param("bin_dir", "bin", id="bin_dir"),
     pytest.param("deploy_root", "deploy", id="deploy_root"),
 ]

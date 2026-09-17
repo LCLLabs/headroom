@@ -610,6 +610,22 @@ def dashboard(port: int, no_open: bool) -> None:
     ),
 )
 @click.option(
+    "--session-delta-log",
+    is_flag=True,
+    help=(
+        "Append message-level post-processing deltas per session "
+        "(Claude Code + Codex). Env: HEADROOM_SESSION_DELTA_LOG."
+    ),
+)
+@click.option(
+    "--session-delta-log-dir",
+    default=None,
+    help=(
+        "Directory for session delta JSONL files (default: "
+        "~/.headroom/logs/sessions)."
+    ),
+)
+@click.option(
     "--budget",
     type=click.FloatRange(min=0.0),
     default=None,
@@ -1051,6 +1067,8 @@ def proxy(
     log_messages: bool,
     codex_wire_debug: bool,
     codex_wire_debug_dir: str | None,
+    session_delta_log: bool,
+    session_delta_log_dir: str | None,
     budget: float | None,
     budget_period: str,
     budget_estimated_basis: str,
@@ -1271,6 +1289,12 @@ def proxy(
         os.environ["HEADROOM_CODEX_WIRE_DEBUG"] = "1"
         os.environ["HEADROOM_CODEX_WIRE_DEBUG_DIR"] = codex_wire_debug_dir or str(
             _paths.codex_wire_debug_dir()
+        )
+
+    if session_delta_log or session_delta_log_dir:
+        os.environ["HEADROOM_SESSION_DELTA_LOG"] = "1"
+        os.environ["HEADROOM_SESSION_DELTA_LOG_DIR"] = session_delta_log_dir or str(
+            _paths.session_delta_log_dir()
         )
 
     # Stateless mode: suppress TOIN filesystem persistence

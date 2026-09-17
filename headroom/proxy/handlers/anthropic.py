@@ -3783,6 +3783,35 @@ class AnthropicHandlerMixin:
                     ),
                 )
 
+                try:
+                    from headroom.proxy.session_delta_log import capture_session_delta_log
+
+                    _rewrite_reasons = list(transforms_applied or [])
+                    for _reason in body_mutation_tracker.reasons:
+                        if _reason not in _rewrite_reasons:
+                            _rewrite_reasons.append(_reason)
+                    capture_session_delta_log(
+                        provider="anthropic",
+                        body=body,
+                        session_id=session_id,
+                        request_id=request_id,
+                        transport="http",
+                        model=model,
+                        rewrite_reasons=_rewrite_reasons,
+                        transforms_applied=transforms_applied,
+                        mutation_reasons=body_mutation_tracker.reasons,
+                        tokens_saved=tokens_saved,
+                        headers=request.headers,
+                        metadata={
+                            "path": pipeline_path,
+                            "stream": bool(stream),
+                        },
+                    )
+                except Exception:
+                    logger.debug(
+                        "[%s] session_delta_log capture failed", request_id, exc_info=True
+                    )
+
                 if stream and not buffered_stream_ccr:
                     self.pipeline_extensions.emit(
                         PipelineStage.POST_SEND,

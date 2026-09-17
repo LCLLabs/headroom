@@ -6130,6 +6130,40 @@ class OpenAIHandlerMixin:
                 },
             )
 
+            try:
+                from headroom.proxy.session_delta_log import capture_session_delta_log
+
+                _delta_session = (
+                    request.headers.get("x-headroom-session-id")
+                    or _responses_session_id
+                    or request_id
+                )
+                _rewrite_reasons = list(transforms_applied or [])
+                for _reason in getattr(body_mutation_tracker, "reasons", []) or []:
+                    if _reason not in _rewrite_reasons:
+                        _rewrite_reasons.append(_reason)
+                capture_session_delta_log(
+                    provider="openai",
+                    body=body,
+                    session_id=_delta_session,
+                    request_id=request_id,
+                    transport="http",
+                    model=model,
+                    rewrite_reasons=_rewrite_reasons,
+                    transforms_applied=transforms_applied,
+                    mutation_reasons=list(getattr(body_mutation_tracker, "reasons", []) or []),
+                    tokens_saved=tokens_saved,
+                    headers=request.headers,
+                    metadata={
+                        "path": request.url.path,
+                        "stream": stream,
+                    },
+                )
+            except Exception:
+                logger.debug(
+                    "[%s] session_delta_log capture failed", request_id, exc_info=True
+                )
+
         # Waste-signal detection for the Responses path (#820). The transform
         # pipeline never runs here (compression goes through CompressionUnits),
         # so parse a telemetry-only message conversion directly, behind the
@@ -8105,6 +8139,32 @@ class OpenAIHandlerMixin:
                     "transforms_applied": transforms_applied,
                 },
             )
+            if isinstance(_first_upstream_body, dict):
+                try:
+                    from headroom.proxy.session_delta_log import capture_session_delta_log
+
+                    capture_session_delta_log(
+                        provider="openai",
+                        body=_first_upstream_body,
+                        session_id=session_id,
+                        request_id=request_id,
+                        transport="websocket",
+                        model=(
+                            _first_upstream_body.get("model")
+                            if isinstance(_first_upstream_body.get("model"), str)
+                            else None
+                        ),
+                        rewrite_reasons=list(transforms_applied or []),
+                        transforms_applied=transforms_applied,
+                        tokens_saved=tokens_saved,
+                        metadata={"frame": 1},
+                    )
+                except Exception:
+                    logger.debug(
+                        "[%s] session_delta_log ws first-frame capture failed",
+                        request_id,
+                        exc_info=True,
+                    )
 
             if ws_connected:
                 async with upstream:
@@ -8617,6 +8677,36 @@ class OpenAIHandlerMixin:
                                         "transforms_applied": transforms_applied,
                                     },
                                 )
+                                if isinstance(_outbound_frame_body, dict):
+                                    try:
+                                        from headroom.proxy.session_delta_log import (
+                                            capture_session_delta_log,
+                                        )
+
+                                        capture_session_delta_log(
+                                            provider="openai",
+                                            body=_outbound_frame_body,
+                                            session_id=session_id,
+                                            request_id=request_id,
+                                            transport="websocket",
+                                            model=(
+                                                _outbound_frame_body.get("model")
+                                                if isinstance(
+                                                    _outbound_frame_body.get("model"), str
+                                                )
+                                                else None
+                                            ),
+                                            rewrite_reasons=list(transforms_applied or []),
+                                            transforms_applied=transforms_applied,
+                                            tokens_saved=tokens_saved,
+                                            metadata={"frame": client_frame_index},
+                                        )
+                                    except Exception:
+                                        logger.debug(
+                                            "[%s] session_delta_log ws frame capture failed",
+                                            request_id,
+                                            exc_info=True,
+                                        )
                                 await upstream.send(_strip_codex_lite_metadata(msg))
                         except asyncio.CancelledError:
                             # Explicit cancel from the outer
