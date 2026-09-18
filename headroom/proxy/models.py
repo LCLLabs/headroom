@@ -370,7 +370,6 @@ class ProxyConfig:
     # Logging
     log_requests: bool = True
     log_file: str | None = None
-    stat_log_file: str | None = None
     log_full_messages: bool = False
 
     # Third-party proxy extensions (opt-in only). List of entry-point names

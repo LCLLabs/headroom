@@ -34,11 +34,6 @@ if TYPE_CHECKING:
     from ..memory.tracker import ComponentStats
 
 from headroom.proxy import request_log_redaction_policy
-from headroom.proxy.category_shift import (
-    CategoryShiftCollector,
-    analyze_category_shift,
-    serialize_category_shift_record,
-)
 from headroom.proxy.models import RequestLog
 
 IMAGE_BASE64_REDACT_THRESHOLD_BYTES = (
@@ -97,16 +92,9 @@ class RequestLogger:
 
     MAX_LOG_ENTRIES = 10_000
 
-    def __init__(
-        self,
-        log_file: str | None = None,
-        log_full_messages: bool = False,
-        stat_log_file: str | None = None,
-    ):
+    def __init__(self, log_file: str | None = None, log_full_messages: bool = False):
         self.log_file = Path(log_file) if log_file else None
-        self.stat_log_file = Path(stat_log_file) if stat_log_file else None
         self.log_full_messages = log_full_messages
-        self._category_shift = CategoryShiftCollector()
         # Use deque with maxlen for automatic FIFO eviction
         self._logs: deque[RequestLog] = deque(maxlen=self.MAX_LOG_ENTRIES)
 
@@ -120,17 +108,6 @@ class RequestLogger:
                     e,
                 )
                 self.log_file = None
-
-        if self.stat_log_file:
-            try:
-                self.stat_log_file.parent.mkdir(parents=True, exist_ok=True)
-            except OSError as e:
-                logger.warning(
-                    "Cannot create stat log directory %s: %s — sampling disabled",
-                    self.stat_log_file.parent,
-                    e,
-                )
-                self.stat_log_file = None
 
     def log(self, entry: RequestLog):
         """Log a request. Oldest entries are automatically removed when limit reached.
@@ -154,38 +131,17 @@ class RequestLogger:
 
         self._logs.append(entry)
 
-        log_record = asdict(entry)
         if self.log_file:
             try:
                 with open(self.log_file, "a") as f:
+                    log_dict = asdict(entry)
                     if not self.log_full_messages:
-                        log_record.pop("request_messages", None)
-                        log_record.pop("compressed_messages", None)
-                        log_record.pop("response_content", None)
-                    f.write(json.dumps(log_record, ensure_ascii=False) + "\n")
+                        log_dict.pop("request_messages", None)
+                        log_dict.pop("compressed_messages", None)
+                        log_dict.pop("response_content", None)
+                    f.write(json.dumps(log_dict) + "\n")
             except OSError:
-                pass
-
-        observation = analyze_category_shift(
-            entry.request_messages,
-            entry.compressed_messages,
-            transforms_applied=entry.transforms_applied,
-        )
-        if observation is not None:
-            self._category_shift.record(observation)
-            if self.stat_log_file:
-                record = serialize_category_shift_record(
-                    request_id=entry.request_id,
-                    timestamp=entry.timestamp,
-                    provider=entry.provider,
-                    model=entry.model,
-                    observation=observation,
-                )
-                try:
-                    with open(self.stat_log_file, "a") as f:
-                        f.write(json.dumps(record, ensure_ascii=False) + "\n")
-                except OSError:
-                    pass
+                pass  # Graceful degradation: memory-only logging continues
 
     def get_recent(self, n: int = 100) -> list[dict]:
         """Get recent log entries (without request/compressed messages and response_content)."""
@@ -210,8 +166,6 @@ class RequestLogger:
         return {
             "total_logged": len(self._logs),
             "log_file": str(self.log_file) if self.log_file else None,
-            "stat_log_file": str(self.stat_log_file) if self.stat_log_file else None,
-            "category_shift": self._category_shift.snapshot(),
         }
 
     def get_memory_stats(self) -> ComponentStats:
