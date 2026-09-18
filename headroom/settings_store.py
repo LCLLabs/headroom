@@ -281,6 +281,29 @@ SETTINGS: tuple[SettingField, ...] = (
         help="Path for the message log file.",
         tier="basic",
     ),
+    SettingField(
+        "HEADROOM_SESSION_DELTA_LOG",
+        "session_delta_log",
+        "Session delta log",
+        "Logging",
+        "bool",
+        default=False,
+        help=(
+            "Append message-level post-processing deltas per session "
+            "(Claude Code + Codex). WARNING: may log sensitive data."
+        ),
+        tier="basic",
+    ),
+    SettingField(
+        "HEADROOM_SESSION_DELTA_LOG_DIR",
+        "session_delta_log_dir",
+        "Session delta log directory",
+        "Logging",
+        "str",
+        default=None,
+        help="Directory for per-session delta JSONL files.",
+        tier="advanced",
+    ),
     # --- Networking (upstream connection pool tuning) ---
     SettingField(
         "HEADROOM_MAX_CONNECTIONS",
