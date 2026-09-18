@@ -9,6 +9,8 @@ import re
 from collections.abc import MutableMapping
 from typing import Any
 
+from headroom.proxy.api_key_stats import API_KEY_ID_TAG
+
 SAVINGS_ATTRIBUTION_TAG = "_headroom_savings_attribution"
 _NAME_RE = re.compile(r"[^a-z0-9_.-]+")
 MAX_SOURCES = 32
@@ -203,7 +205,7 @@ def from_tags(tags: MutableMapping[str, Any] | None) -> list[dict[str, Any]]:
     return [dict(item) for item in raw[:MAX_SOURCES] if isinstance(item, dict)]
 
 
-_INTERNAL_TAGS = frozenset({SAVINGS_ATTRIBUTION_TAG, STAGE_TIMING_TAG})
+_INTERNAL_TAGS = frozenset({SAVINGS_ATTRIBUTION_TAG, STAGE_TIMING_TAG, API_KEY_ID_TAG})
 
 
 def public_tags(tags: MutableMapping[str, Any] | None) -> dict[str, Any]:

@@ -79,6 +79,79 @@ def test_snapshot_accumulates_request_token_cache_cost_and_waste_metrics() -> No
     assert snapshot["by_model"]["claude-test"]["input_tokens"] == 100
 
 
+def test_snapshot_groups_compression_by_api_key_on_one_local_token_scale() -> None:
+    state = _new_state()
+
+    state.record_request(
+        provider="openai",
+        stack="codex",
+        model="gpt-test",
+        # Provider count deliberately differs from the local count below.
+        input_tokens=900,
+        api_key_input_tokens=600,
+        output_tokens=40,
+        attempted_input_tokens=750,
+        tokens_saved=150,
+        api_key_id="key_0123456789abcdef",
+    )
+    state.record_request(
+        provider="openai",
+        stack="codex",
+        model="gpt-test",
+        input_tokens=300,
+        api_key_input_tokens=240,
+        output_tokens=20,
+        attempted_input_tokens=300,
+        tokens_saved=60,
+        api_key_id="key_0123456789abcdef",
+    )
+    state.record_request(
+        provider="openai",
+        stack="codex",
+        model="gpt-test",
+        input_tokens=10,
+    )
+
+    snapshot = state.snapshot(persistence={"enabled": True, "healthy": True})
+    row = snapshot["api_keys"]["keys"]["key_0123456789abcdef"]
+
+    assert row["requests"] == 2
+    assert row["before_tokens"] == 1050
+    assert row["after_tokens"] == 840
+    assert row["tokens_saved"] == 210
+    assert row["output_tokens"] == 60
+    assert row["savings_percent"] == 20.0
+    assert snapshot["api_keys"]["coverage"] == {
+        "tracked_keys": 1,
+        "attributed_requests": 2,
+        "unattributed_requests": 1,
+    }
+    assert snapshot["api_keys"]["privacy"] == "sha256-prefix-16"
+
+
+def test_api_key_aggregate_round_trips_through_persisted_state() -> None:
+    state = _new_state()
+    state.record_request(
+        provider="anthropic",
+        stack="claude-code",
+        model="claude-test",
+        input_tokens=80,
+        api_key_input_tokens=80,
+        tokens_saved=20,
+        api_key_id="key_fedcba9876543210",
+    )
+
+    restored = PersistentMetricsState(state.to_dict(), now=lambda: FIXED_NOW)
+    row = restored.snapshot(persistence={"enabled": True})["api_keys"]["keys"][
+        "key_fedcba9876543210"
+    ]
+
+    assert row["requests"] == 1
+    assert row["before_tokens"] == 100
+    assert row["after_tokens"] == 80
+    assert row["savings_percent"] == 20.0
+
+
 def test_snapshot_uses_null_for_ratios_without_a_denominator() -> None:
     snapshot = _new_state().snapshot(persistence={"enabled": True, "healthy": True})
 

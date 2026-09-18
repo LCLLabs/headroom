@@ -51,3 +51,12 @@ def test_dashboard_only_references_served_assets(client):
     html = client.get("/dashboard").text
     for asset in ASSETS:
         assert f"/dashboard/static/{asset}" in html
+
+
+def test_dashboard_exposes_persistent_api_key_compression_table_without_raw_key_fields():
+    html = get_dashboard_html()
+
+    assert "API Key Compression" in html
+    assert "lifetimeStats.api_keys?.keys" in html
+    assert "irreversible SHA-256 fingerprints" in html
+    assert "raw_api_key" not in html

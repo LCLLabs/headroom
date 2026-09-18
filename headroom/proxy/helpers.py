@@ -295,11 +295,22 @@ def extract_tags(headers: Any) -> dict[str, str]:
     Header name match is case-insensitive; the returned key has the
     ``x-headroom-`` prefix stripped.
     """
-    return {
+    tags = {
         k.lower().replace("x-headroom-", ""): v
         for k, v in headers.items()
         if k.lower().startswith("x-headroom-")
     }
+    # Credential attribution is an internal tag because ``tags`` is the one
+    # request-scoped value that every provider handler carries into the common
+    # RequestOutcome funnel.  Only a SHA-256 fingerprint is attached; the raw
+    # API key never leaves request ingress and public_tags strips this field
+    # before RequestLog serialization.
+    from headroom.proxy.api_key_stats import API_KEY_ID_TAG, fingerprint_api_key
+
+    api_key_id = fingerprint_api_key(headers)
+    if api_key_id is not None:
+        tags[API_KEY_ID_TAG] = api_key_id
+    return tags
 
 
 def _headroom_bypass_enabled(headers: Any) -> bool:

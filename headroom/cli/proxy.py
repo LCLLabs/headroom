@@ -587,6 +587,16 @@ def dashboard(port: int, no_open: bool) -> None:
     ),
 )
 @click.option(
+    "--stat-log-file",
+    default=None,
+    envvar="HEADROOM_STAT_LOG_FILE",
+    help=(
+        "Path to write category-shift sample logs as JSONL. "
+        "Each line captures pre/post content types and sampled messages. "
+        "Disabled in --stateless mode. Env: HEADROOM_STAT_LOG_FILE."
+    ),
+)
+@click.option(
     "--log-messages",
     is_flag=True,
     envvar="HEADROOM_LOG_MESSAGES",
@@ -1066,6 +1076,7 @@ def proxy(
     anthropic_pre_upstream_memory_context_timeout_seconds: float | None,
     compression_max_workers: int | None,
     log_file: str | None,
+    stat_log_file: str | None,
     log_messages: bool,
     codex_wire_debug: bool,
     codex_wire_debug_dir: str | None,
@@ -1422,6 +1433,7 @@ def proxy(
         http2=http2,
         http_proxy=http_proxy,
         log_file=None if is_stateless else log_file,
+        stat_log_file=None if is_stateless else stat_log_file,
         log_full_messages=log_messages
         or os.environ.get("HEADROOM_LOG_MESSAGES", "").lower() in ("true", "1", "yes", "on"),
         budget_limit_usd=budget,

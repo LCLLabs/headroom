@@ -266,6 +266,21 @@ async def test_funnel_calls_metrics_with_full_kwargs() -> None:
     assert kwargs["cache_write_1h_tokens"] == 50
     assert kwargs["uncached_input_tokens"] == 0
     assert kwargs["attempted_input_tokens"] == 800
+    assert kwargs["api_key_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_funnel_passes_internal_api_key_fingerprint_without_logging_it() -> None:
+    from headroom.proxy.api_key_stats import API_KEY_ID_TAG
+
+    h = _FunnelHarness()
+    await h._record_request_outcome(
+        _outcome(tags={API_KEY_ID_TAG: "key_0123456789abcdef", "project": "storage"})
+    )
+
+    kwargs = h.metrics.record_request.await_args.kwargs
+    assert kwargs["api_key_id"] == "key_0123456789abcdef"
+    assert h.logger.logs[0].tags == {"project": "storage"}
 
 
 @pytest.mark.asyncio

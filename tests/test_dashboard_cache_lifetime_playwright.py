@@ -125,3 +125,35 @@ def test_card_hidden_when_no_session_and_no_lifetime_data() -> None:
         expect(page.get_by_text("Prefix Cache Impact", exact=True)).to_have_count(0)
 
         browser.close()
+
+
+def test_lifetime_view_renders_persistent_api_key_compression_breakdown() -> None:
+    lifetime = _lifetime_cache_payload()
+    lifetime["api_keys"] = {
+        "keys": {
+            "key_0123456789abcdef": {
+                "requests": 12,
+                "before_tokens": 100_000,
+                "after_tokens": 72_000,
+                "tokens_saved": 28_000,
+                "savings_percent": 28.0,
+                "last_activity_at": "2026-08-31T03:00:00Z",
+            }
+        },
+        "coverage": {"attributed_requests": 12, "unattributed_requests": 3},
+        "privacy": "sha256-prefix-16",
+    }
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch()
+        page = browser.new_page(viewport={"width": 1440, "height": 1800})
+        _open_dashboard(page, _session_stats_no_cache(), lifetime)
+        page.get_by_role("button", name="Lifetime", exact=True).click()
+
+        expect(page.get_by_text("API Key Compression", exact=True)).to_be_visible()
+        expect(page.get_by_text("key_0123456789abcdef", exact=True)).to_be_visible()
+        expect(page.get_by_text("28.0%", exact=True)).to_be_visible()
+        expect(page.get_by_text("12 attributed", exact=True)).to_be_visible()
+        expect(page.get_by_text("3 unattributed", exact=True)).to_be_visible()
+
+        browser.close()
