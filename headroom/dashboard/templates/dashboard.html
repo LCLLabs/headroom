@@ -286,27 +286,6 @@
                             </div>
                             <div x-text="'Samples: ' + formatNumber(stats.request_logger?.category_shift?.total?.requests_analyzed || 0)"></div>
                         </div>
-
-                        <!-- Requests per content type, pre- vs post-compression.
-                             Each request is counted once, under its dominant type. -->
-                        <template x-if="stats.request_logger?.category_shift?.total?.requests_analyzed">
-                            <div class="mt-3 pt-3 border-t border-border">
-                                <div class="flex text-xs text-gray-500 uppercase tracking-wide">
-                                    <span class="flex-1">Requests by type</span>
-                                    <span class="w-14 text-right">Before</span>
-                                    <span class="w-14 text-right">After</span>
-                                </div>
-                                <template x-for="row in (stats.request_logger?.category_shift?.total?.request_type_totals || [])" :key="row.type">
-                                    <div class="flex text-xs text-gray-400 mt-1">
-                                        <span class="flex-1" x-text="row.type"></span>
-                                        <span class="w-14 text-right tabular-nums" x-text="formatNumber(row.before)"></span>
-                                        <span class="w-14 text-right tabular-nums"
-                                              :class="row.delta === 0 ? '' : (row.delta > 0 ? 'text-accent' : 'text-gray-500')"
-                                              x-text="formatNumber(row.after)"></span>
-                                    </div>
-                                </template>
-                            </div>
-                        </template>
                     </div>
 
                     <!-- Dynamic attribution for any named savings source. These
