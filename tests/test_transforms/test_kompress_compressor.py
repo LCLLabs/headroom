@@ -68,6 +68,51 @@ class TestLazyImports:
         assert result.savings_percentage == 50.0
 
 
+class TestCcrMarkerRatioThreshold:
+    """HEADROOM_CCR_MARK_LOW_RATIO gray-rollout gate for CCR marker injection.
+
+    ContentRouterConfig's own acceptance floor (min_ratio_relaxed/aggressive)
+    is 1.0 -- "any real shrink is worth taking" -- but a KOMPRESS/TEXT/
+    CODE_AWARE result only gets a CCR marker (and so survives the tool_result
+    reversibility guard) when this threshold says so. Off by default keeps
+    the historical 0.8 cutoff; on matches the router's floor of 1.0.
+    """
+
+    def test_default_is_legacy_threshold(self, monkeypatch) -> None:
+        import headroom.transforms.kompress_compressor as kmod
+
+        monkeypatch.delenv(kmod.CCR_MARK_LOW_RATIO_ENV, raising=False)
+        assert kmod._ccr_marker_ratio_threshold() == 0.8
+
+    def test_flag_on_relaxes_to_any_shrink(self, monkeypatch) -> None:
+        import headroom.transforms.kompress_compressor as kmod
+
+        monkeypatch.setenv(kmod.CCR_MARK_LOW_RATIO_ENV, "1")
+        assert kmod._ccr_marker_ratio_threshold() == 1.0
+
+    def test_unrecognized_value_keeps_legacy_threshold(self, monkeypatch) -> None:
+        import headroom.transforms.kompress_compressor as kmod
+
+        monkeypatch.setenv(kmod.CCR_MARK_LOW_RATIO_ENV, "nope")
+        assert kmod._ccr_marker_ratio_threshold() == 0.8
+
+    def test_low_ratio_compression_crosses_threshold_only_when_flag_on(
+        self, monkeypatch
+    ) -> None:
+        """A 10%-savings result (ratio=0.9) sits below the legacy 0.8 cutoff --
+        `enable_ccr and ratio < threshold` is False, so no marker is attempted
+        and a `tool_result` using it would fail content_router's reversibility
+        guard even though the router's own acceptance floor (min_ratio=1.0)
+        wanted the savings. Flipping the gray flag brings it inside the gate."""
+        import headroom.transforms.kompress_compressor as kmod
+
+        ratio = 0.9
+        monkeypatch.delenv(kmod.CCR_MARK_LOW_RATIO_ENV, raising=False)
+        assert ratio >= kmod._ccr_marker_ratio_threshold()  # gate closed
+        monkeypatch.setenv(kmod.CCR_MARK_LOW_RATIO_ENV, "1")
+        assert ratio < kmod._ccr_marker_ratio_threshold()  # gate open
+
+
 class TestKompressBackendSelection:
     def test_selected_backend_aliases(self, monkeypatch) -> None:
         import headroom.transforms.kompress_compressor as kmod

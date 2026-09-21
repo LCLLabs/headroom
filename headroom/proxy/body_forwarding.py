@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+from collections import Counter
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -197,19 +198,84 @@ def thinking_preserving_mutations_enabled() -> bool:
     return raw.strip().lower() not in ("0", "false", "no", "off")
 
 
-def thinking_block_fingerprint(body: Any) -> list[tuple[int, int, str]]:
-    """Positional, order-sensitive fingerprint of every thinking block.
+#: Compare thinking blocks by content only, ignoring where in ``messages`` they
+#: sit, and tolerate blocks that were removed (or converted away from
+#: ``thinking``) entirely. **Default OFF** (gray rollout) -- set to
+#: ``1``/``true``/``yes`` to switch on; unset or any other value keeps today's
+#: positional (message_index, block_index) exact-match fingerprint.
+#:
+#: The lock this relaxes is a false-positive, not a safety hole: Anthropic's
+#: ``signature`` binds a thinking block's own content, not its position (see the
+#: live-API evidence above ``THINKING_PRESERVING_MUTATIONS_ENV``). Two separate
+#: false positives share this one flag because both stem from the same
+#: over-strict "sets must match exactly" comparison:
+#:
+#: 1. **Position drift.** A mutation that only moves *other* messages around --
+#:    ``explore_pruner`` dropping an old message, ``system_role_relocated``
+#:    moving the system message into ``messages`` -- shifts every later
+#:    thinking block's index without touching its bytes. The positional
+#:    fingerprint reads that shift as "the thinking block changed".
+#: 2. **Deliberate removal.** ``thinking_compactor.compact_thinking_to_text``
+#:    converts older thinking blocks to plain ``text`` on purpose -- that is
+#:    the entire point of the transform. Those blocks then vanish from the
+#:    current body's fingerprint while still present in the original's, so an
+#:    *equality* comparison (even an order-insensitive one) reads "fewer blocks
+#:    present" as tampering and locks to client bytes on every request that
+#:    actually compacted anything -- verified against a real captured session
+#:    (``alex/revoked-explore-missing-focus.raw.jsonl``): after compaction,
+#:    ``outbound_body_is_client_bytes`` was still ``True`` even with an
+#:    order-insensitive *equality* fingerprint.
+#:
+#: The fix for both is the same relaxation: check that the body's surviving
+#: thinking blocks are a MULTISET SUBSET of the original's, not that the two
+#: multisets are equal. Losing blocks (mutation 2) is then fine by
+#: construction; gaining, or altering, one is not -- a block that is still
+#: typed ``thinking``/``redacted_thinking`` in the outgoing body but is not
+#: byte-identical to some block the client actually sent (edited in place, or
+#: fabricated) has no match in the original multiset and still fails the
+#: subset test, so it still locks. Nothing that would have been rejected by
+#: Anthropic's signature check is masked -- only blocks we deliberately dropped
+#: or moved are excused.
+THINKING_FINGERPRINT_UNORDERED_ENV = "HEADROOM_THINKING_FINGERPRINT_UNORDERED"
 
-    Each entry is ``(message_index, block_index, canonical_json_of_block)``, so
-    the comparison catches a block whose text or ``signature`` changed, one that
-    was added, removed, reordered, or moved between messages. Keys are sorted so
-    a dict rebuilt in a different order is not mistaken for an edit -- the wire
-    contract is over parsed values, not key order.
+
+def _thinking_fingerprint_unordered_enabled() -> bool:
+    raw = os.environ.get(THINKING_FINGERPRINT_UNORDERED_ENV, "")
+    return raw.strip().lower() in ("1", "true", "yes")
+
+
+def thinking_block_fingerprint(body: Any) -> list[tuple[int, int, str]] | list[str]:
+    """Fingerprint of every thinking block, for detecting tampering.
+
+    With ``HEADROOM_THINKING_FINGERPRINT_UNORDERED`` set, returns the canonical
+    JSON of every thinking/redacted_thinking block as a sorted list -- an
+    order-insensitive multiset -- so moving unrelated messages around does not
+    register as an edit. By default (flag unset), returns the legacy positional
+    ``(message_index, block_index, canonical_json_of_block)`` tuples. Either way,
+    keys within each block are sorted so a dict rebuilt in a different order is
+    not mistaken for an edit -- the wire contract is over parsed values, not key
+    order.
     """
-    out: list[tuple[int, int, str]] = []
     messages = body.get("messages") if isinstance(body, dict) else None
     if not isinstance(messages, list):
-        return out
+        return []
+    if _thinking_fingerprint_unordered_enabled():
+        blocks: list[str] = []
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            content = message.get("content")
+            if not isinstance(content, list):
+                continue
+            for block in content:
+                if isinstance(block, dict) and block.get("type") in {
+                    "thinking",
+                    "redacted_thinking",
+                }:
+                    blocks.append(json.dumps(block, sort_keys=True, ensure_ascii=False))
+        return sorted(blocks)
+
+    out: list[tuple[int, int, str]] = []
     for message_index, message in enumerate(messages):
         if not isinstance(message, dict):
             continue
@@ -236,7 +302,7 @@ def thinking_blocks_survived_mutation(
     original_body_bytes: bytes | None,
     original: dict[str, Any] | None = None,
 ) -> bool:
-    """True when every thinking block is byte-equal to the one the client sent.
+    """True when no surviving thinking block was altered from what the client sent.
 
     This is the whole point of the relaxation. Anthropic signs the thinking
     block, not the request: the signature covers that block's own content, so
@@ -251,6 +317,18 @@ def thinking_blocks_survived_mutation(
     ``tests/test_thinking_signature_scope_live.py``, which also pins the one
     thing Anthropic does reject (a forged ``signature``).
 
+    With ``HEADROOM_THINKING_FINGERPRINT_UNORDERED`` set, the check is a
+    multiset SUBSET test: every thinking/redacted_thinking block still present
+    in ``body`` must have a byte-identical match in ``original``'s blocks, but
+    ``original`` may hold MORE blocks than ``body`` does. This is what makes it
+    safe to combine with ``thinking_compactor.compact_thinking_to_text``, which
+    deliberately converts older thinking blocks to plain text -- those blocks
+    are then absent from ``body``'s fingerprint on purpose, not because they
+    were tampered with. A block that is still typed ``thinking`` in ``body`` but
+    isn't found in ``original`` (edited in place, or fabricated) has no match
+    and still fails the test. Without the flag, the check is the legacy exact
+    equality (both multiset membership AND count must match).
+
     Conservative by construction: any parse failure, or any detectable
     difference at all, returns False and the caller keeps today's passthrough.
 
@@ -262,7 +340,17 @@ def thinking_blocks_survived_mutation(
     if original is None:
         return False
     try:
-        return thinking_block_fingerprint(body) == thinking_block_fingerprint(original)
+        fp_body = thinking_block_fingerprint(body)
+        fp_original = thinking_block_fingerprint(original)
+        if not _thinking_fingerprint_unordered_enabled():
+            return fp_body == fp_original
+        # Both are sorted lists of canonical JSON strings here (the unordered
+        # shape) -- a multiset subset check via Counter, allowing `body` to be
+        # missing entries `original` had (deliberately compacted away) but not
+        # to hold anything `original` didn't.
+        remaining = Counter(fp_original)
+        remaining.subtract(fp_body)
+        return all(count >= 0 for count in remaining.values())
     except (TypeError, ValueError, RecursionError):
         # An unserializable block (or pathological nesting) means we cannot prove
         # the blocks are untouched, so we must not claim they are.

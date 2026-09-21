@@ -56,10 +56,18 @@ def bills_prior_thinking(model: str) -> bool:
     False unless the version is confidently >= 4.6, because compacting on a stripping
     model would turn free (stripped) thinking into billed text. (Opus 4.5 reportedly
     bills too, but is excluded here pending verification — costs only missed savings.)
+
+    Also reached (via the openai.py reasoning-compaction path) for third-party
+    model strings that don't share Anthropic's hyphenated ``major-minor``
+    convention, e.g. ``glm-5.3``, ``qwen3.7-max``, ``deepseek-v4-flash-0731``.
+    Dots are normalized to hyphens before splitting so a dotted minor version
+    (``5.3`` -> ``5``, ``3``) parses the same as Anthropic's ``4-6``; a version
+    token is capped at 2 digits so a date-like suffix (``0731``, ``20250929``)
+    can't be misread as a huge major version.
     """
     nums: list[int] = []
-    for part in model.lower().split("-"):
-        if part.isdigit():
+    for part in model.lower().replace(".", "-").split("-"):
+        if part.isdigit() and len(part) <= 2:
             nums.append(int(part))
         elif nums:
             break  # version digits are contiguous; stop at the family/date boundary
@@ -356,6 +364,13 @@ def _demo() -> None:
     assert not bills_prior_thinking("claude-sonnet-4-5-20250929")
     assert not bills_prior_thinking("claude-haiku-4-5-20251001")
     assert not bills_prior_thinking("claude-3-5-sonnet-20241022")
+
+    # third-party naming conventions (dotted minor, fused family+version, date
+    # suffixes that must not be misread as a version number)
+    assert bills_prior_thinking("glm-5.3")
+    assert bills_prior_thinking("qwen3.7-max")
+    assert bills_prior_thinking("gpt-5.5")
+    assert not bills_prior_thinking("deepseek-v4-flash-0731")
 
     # cache_control on a thinking block is carried to the emitted text block
     msgs_cc: list[dict[str, Any]] = [

@@ -3721,6 +3721,69 @@ class AnthropicHandlerMixin:
                     tools = _ttl_tools
                     body_mutation_tracker.mark_mutated("cache_control_ttl_order")
 
+                # Thinking compaction (HEADROOM_THINKING_COMPACT, off by default).
+                # Runs here -- after every other body mutation, before the final
+                # signed-thinking lock check just below -- so (a) the fingerprint
+                # that check computes sees the truly final messages, and (b) this
+                # is the only place that can tell whether the compaction will
+                # actually reach the wire: on Claude 4.6+/5.x, prior-turn thinking
+                # is billed as input, so shrinking it only pays off if the edit
+                # survives ``select_outbound_body``'s signed-thinking lock, which
+                # requires ``HEADROOM_THINKING_FINGERPRINT_UNORDERED`` (the blocks
+                # this converts to text are deliberately absent from the
+                # post-compaction fingerprint -- see body_forwarding.py). Gated on
+                # ``bills_prior_thinking(model)`` so a pre-4.6 model (which the
+                # server already strips prior thinking for, for free) never has
+                # its thinking turned into billed text instead.
+                if os.environ.get("HEADROOM_THINKING_COMPACT", "").strip().lower() in (
+                    "1",
+                    "true",
+                    "yes",
+                ):
+                    try:
+                        from headroom.transforms.compression_units import find_content_router
+                        from headroom.transforms.thinking_compactor import (
+                            bills_prior_thinking,
+                            compact_thinking_to_text,
+                        )
+
+                        if bills_prior_thinking(model):
+                            _tc_keep = int(
+                                os.environ.get("HEADROOM_THINKING_COMPACT_KEEP_LAST", "1")
+                            )
+                            _tc_router = find_content_router(self.anthropic_pipeline)
+                            _tc_kompress = (
+                                (_tc_router._get_remote_kompress() or _tc_router._get_kompress())
+                                if _tc_router is not None
+                                else None
+                            )
+                            if _tc_kompress is not None:
+                                _tc_messages, _tc_stats = compact_thinking_to_text(
+                                    body.get("messages"),
+                                    kompress=_tc_kompress,
+                                    keep_last_turns=_tc_keep,
+                                    min_words=40,
+                                )
+                                if _tc_stats["turns_compacted"]:
+                                    body["messages"] = _tc_messages
+                                    optimized_messages = _tc_messages
+                                    body_mutation_tracker.mark_mutated("thinking_compact")
+                                    transforms_applied.append(
+                                        f"anthropic:thinking_compact:{_tc_stats['turns_compacted']}"
+                                    )
+                                    logger.info(
+                                        "[%s] thinking compact: %d turns, %d blocks, %d->%d words",
+                                        request_id,
+                                        _tc_stats["turns_compacted"],
+                                        _tc_stats["blocks"],
+                                        _tc_stats["words_before"],
+                                        _tc_stats["words_after"],
+                                    )
+                    except Exception as _tc_exc:  # never break the request on compaction
+                        logger.warning(
+                            "[%s] thinking compaction skipped: %s", request_id, _tc_exc
+                        )
+
                 # Signed thinking locks the request to the client's original
                 # bytes. Once all mutation sites have run, make every downstream
                 # observer use that same wire body and neutralize savings from

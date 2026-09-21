@@ -1868,6 +1868,157 @@ def test_thinking_block_key_reorder_is_not_an_edit(monkeypatch: pytest.MonkeyPat
     assert thinking_blocks_survived_mutation(mutated, original) is True
 
 
+# ---------------------------------------------------------------------------
+# Position-insensitive / removal-tolerant thinking fingerprint
+# (``HEADROOM_THINKING_FINGERPRINT_UNORDERED``)
+#
+# The legacy fingerprint is positional: (message_index, block_index, json).
+# Any transform that inserts/removes/reorders an unrelated message (explore
+# pruning, system-role relocation) shifts every later thinking block's index
+# without touching a single byte, and the legacy fingerprint reads that as
+# tampering -- discarding every computed compression on that turn. Separately,
+# ``thinking_compactor.compact_thinking_to_text`` deliberately converts OLDER
+# thinking blocks to plain text, so those blocks are intentionally absent from
+# the fingerprint of the outgoing body -- a real captured session
+# (``alex/revoked-explore-missing-focus.raw.jsonl``) confirmed that an
+# order-insensitive but still *exact* comparison still locks in that case,
+# because block counts genuinely differ. The fix is a multiset SUBSET test:
+# ``body``'s surviving thinking blocks must each match one of ``original``'s,
+# but ``original`` may hold more than ``body`` does.
+# ---------------------------------------------------------------------------
+
+
+def test_index_shift_without_content_change_still_locks_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Baseline: flag unset keeps the legacy positional false-positive."""
+    monkeypatch.delenv("HEADROOM_THINKING_FINGERPRINT_UNORDERED", raising=False)
+    monkeypatch.setenv("HEADROOM_THINKING_PRESERVING_MUTATIONS", "1")
+    original_body = {
+        "messages": [
+            {"role": "user", "content": [{"type": "text", "text": "old turn"}]},
+            {"role": "assistant", "content": [dict(_TB_SIGNED_BLOCK)]},
+        ]
+    }
+    original = json.dumps(original_body).encode()
+    # Unrelated older message pruned -> the thinking block's index shifts from
+    # (1, 0) to (0, 0) even though its bytes are untouched.
+    mutated = {"messages": [{"role": "assistant", "content": [dict(_TB_SIGNED_BLOCK)]}]}
+
+    assert thinking_blocks_survived_mutation(mutated, original) is False
+    outbound = _tb_select(mutated, original)
+    assert outbound.source == "passthrough"
+    assert outbound.dropped_mutations is True
+
+
+def test_index_shift_without_content_change_survives_when_flag_on(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The flag fixes the pure index-shift false positive (no content changed)."""
+    monkeypatch.setenv("HEADROOM_THINKING_FINGERPRINT_UNORDERED", "1")
+    monkeypatch.setenv("HEADROOM_THINKING_PRESERVING_MUTATIONS", "1")
+    original_body = {
+        "messages": [
+            {"role": "user", "content": [{"type": "text", "text": "old turn"}]},
+            {"role": "assistant", "content": [dict(_TB_SIGNED_BLOCK)]},
+        ]
+    }
+    original = json.dumps(original_body).encode()
+    mutated = {"messages": [{"role": "assistant", "content": [dict(_TB_SIGNED_BLOCK)]}]}
+
+    assert thinking_blocks_survived_mutation(mutated, original) is True
+    outbound = _tb_select(mutated, original)
+    assert outbound.source != "passthrough" or outbound.dropped_mutations is False
+
+
+def test_compacted_away_thinking_blocks_survive_when_flag_on(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """thinking_compactor's whole point -- removing older blocks -- must unlock.
+
+    Regression for the real-traffic case in
+    ``alex/revoked-explore-missing-focus.raw.jsonl``: after
+    ``compact_thinking_to_text`` converts every non-kept thinking block to
+    plain text, only the kept (most recent) block remains typed ``thinking``.
+    An exact-equality comparison -- even order-insensitive -- still sees fewer
+    blocks and locks; the subset comparison must not.
+    """
+    monkeypatch.setenv("HEADROOM_THINKING_FINGERPRINT_UNORDERED", "1")
+    monkeypatch.setenv("HEADROOM_THINKING_PRESERVING_MUTATIONS", "1")
+    kept_block = {"type": "thinking", "thinking": "kept verbatim", "signature": "sig_kept"}
+    dropped_block = {"type": "thinking", "thinking": "old reasoning " * 60, "signature": "sig_old"}
+    original_body = {
+        "messages": [
+            {"role": "assistant", "content": [dict(dropped_block)]},
+            {"role": "user", "content": [{"type": "text", "text": "go on"}]},
+            {"role": "assistant", "content": [dict(kept_block)]},
+        ]
+    }
+    original = json.dumps(original_body).encode()
+    # Simulates compact_thinking_to_text: the old block becomes a text block,
+    # the kept block passes through byte-identical.
+    mutated = {
+        "messages": [
+            {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "[prior reasoning, compressed] ..."}],
+            },
+            {"role": "user", "content": [{"type": "text", "text": "go on"}]},
+            {"role": "assistant", "content": [dict(kept_block)]},
+        ]
+    }
+
+    assert thinking_blocks_survived_mutation(mutated, original) is True
+    outbound = _tb_select(mutated, original)
+    assert outbound.source != "passthrough" or outbound.dropped_mutations is False
+    assert b"sig_kept" in outbound.content
+
+
+@pytest.mark.parametrize(
+    ("label", "tamper"),
+    [
+        (
+            "kept_block_edited_in_place",
+            lambda b: b["messages"][2]["content"][0].__setitem__("thinking", "tampered"),
+        ),
+        (
+            "fabricated_new_thinking_block",
+            lambda b: b["messages"][1]["content"].append(
+                {"type": "thinking", "thinking": "fabricated", "signature": "forged"}
+            ),
+        ),
+    ],
+)
+def test_subset_relaxation_still_locks_real_tampering(
+    monkeypatch: pytest.MonkeyPatch, label: str, tamper
+) -> None:
+    """Removal is fine; editing a surviving block or fabricating one is not."""
+    monkeypatch.setenv("HEADROOM_THINKING_FINGERPRINT_UNORDERED", "1")
+    monkeypatch.setenv("HEADROOM_THINKING_PRESERVING_MUTATIONS", "1")
+    kept_block = {"type": "thinking", "thinking": "kept verbatim", "signature": "sig_kept"}
+    original_body = {
+        "messages": [
+            {
+                "role": "assistant",
+                "content": [{"type": "thinking", "thinking": "old", "signature": "sig_old"}],
+            },
+            {"role": "user", "content": [{"type": "text", "text": "go on"}]},
+            {"role": "assistant", "content": [dict(kept_block)]},
+        ]
+    }
+    original = json.dumps(original_body).encode()
+    mutated = json.loads(original)
+    mutated["messages"][0]["content"] = [
+        {"type": "text", "text": "[prior reasoning, compressed] ..."}
+    ]
+    tamper(mutated)
+
+    assert thinking_blocks_survived_mutation(mutated, original) is False, label
+    outbound = _tb_select(mutated, original)
+    assert outbound.source == "passthrough", label
+    assert outbound.dropped_mutations is True, label
+
+
 def test_is_client_bytes_agrees_with_selection(monkeypatch: pytest.MonkeyPatch) -> None:
     """The CCR buffering probe must never disagree with the forwarder (#2952)."""
     monkeypatch.setenv("HEADROOM_THINKING_PRESERVING_MUTATIONS", "1")

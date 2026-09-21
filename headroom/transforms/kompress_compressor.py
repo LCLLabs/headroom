@@ -1281,6 +1281,32 @@ class KompressResult:
         return (self.tokens_saved / self.original_tokens) * 100
 
 
+#: Below this compression ratio, a CCR marker is always attempted regardless of
+#: ``HEADROOM_CCR_MARK_LOW_RATIO`` -- kept for continuity with the historical
+#: threshold, not because ratios below it are special.
+_CCR_MARKER_ALWAYS_RATIO = 0.8
+
+#: **Default OFF** (gray rollout) -- set to ``1``/``true``/``yes`` to attempt a
+#: CCR marker for every ratio < 1.0 (any real shrink), matching
+#: ``ContentRouterConfig.min_ratio_relaxed``/``min_ratio_aggressive`` (both
+#: 1.0 by default: "any shrink is worth taking"). With the flag off, a
+#: compression that only saves 0-20% (``0.8 <= ratio < 1.0``) never gets a
+#: marker stored, which -- for a ``tool_result`` under content_router's
+#: reversibility guard -- means the whole block is rejected and reverted to
+#: the original, even though content_router's own floor would have accepted
+#: the savings. Turning this on closes that gap; it does not weaken the
+#: guard, since a marker is still only kept when ``_store_in_ccr`` actually
+#: succeeds.
+CCR_MARK_LOW_RATIO_ENV = "HEADROOM_CCR_MARK_LOW_RATIO"
+
+
+def _ccr_marker_ratio_threshold() -> float:
+    raw = os.environ.get(CCR_MARK_LOW_RATIO_ENV, "")
+    if raw.strip().lower() in ("1", "true", "yes"):
+        return 1.0
+    return _CCR_MARKER_ALWAYS_RATIO
+
+
 def ccr_retrieval_marker(
     n_words: int, compressed_count: int, ccr_source: str, cache_key: str
 ) -> str:
@@ -1724,7 +1750,7 @@ class KompressCompressor(Transform):
             )
 
             # CCR marker
-            if self.config.enable_ccr and ratio < 0.8:
+            if self.config.enable_ccr and ratio < _ccr_marker_ratio_threshold():
                 ccr_source = ccr_original if ccr_original is not None else content
                 ccr_source_tokens = len(ccr_source.split())
                 cache_key = self._store_in_ccr(ccr_source, compressed, ccr_source_tokens)
@@ -2117,7 +2143,7 @@ class KompressCompressor(Transform):
                 model_used=self.config.model_id,
             )
 
-            if self.config.enable_ccr and comp_ratio < 0.8:
+            if self.config.enable_ccr and comp_ratio < _ccr_marker_ratio_threshold():
                 ccr_source = ccr_sources[text_idx]
                 if ccr_source is None:
                     ccr_source = content
