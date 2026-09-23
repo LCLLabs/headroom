@@ -47,6 +47,18 @@ _CACHE_CAP = 8192
 _MARKER = "[prior reasoning, compressed]"
 
 
+_PLAIN_TEXT_REASONING_FAMILIES = ("deepseek", "glm", "qwen", "minimax", "kimi")
+"""Third-party families whose reasoning is a plain-text field/tag (``reasoning_content``
+or inline ``<think>...</think>``), never an opaque server-side handle like
+Claude/OpenAI's own models -- see ``cold_prefix.py``. Resending it is *always*
+billed as ordinary input text, regardless of model generation, so for these
+families ``bills_prior_thinking`` short-circuits to True instead of trying to
+parse a version number out of the name (that parsing is unreliable across
+naming conventions and is irrelevant here anyway: unlike Claude, there is no
+"pre-N.M strips it server-side" generation to protect against).
+"""
+
+
 def bills_prior_thinking(model: str) -> bool:
     """True if ``model`` re-bills prior-turn thinking as input (so compaction pays).
 
@@ -57,16 +69,29 @@ def bills_prior_thinking(model: str) -> bool:
     model would turn free (stripped) thinking into billed text. (Opus 4.5 reportedly
     bills too, but is excluded here pending verification — costs only missed savings.)
 
-    Also reached (via the openai.py reasoning-compaction path) for third-party
-    model strings that don't share Anthropic's hyphenated ``major-minor``
-    convention, e.g. ``glm-5.3``, ``qwen3.7-max``, ``deepseek-v4-flash-0731``.
-    Dots are normalized to hyphens before splitting so a dotted minor version
-    (``5.3`` -> ``5``, ``3``) parses the same as Anthropic's ``4-6``; a version
-    token is capped at 2 digits so a date-like suffix (``0731``, ``20250929``)
-    can't be misread as a huge major version.
+    Third-party families in ``_PLAIN_TEXT_REASONING_FAMILIES`` (deepseek, glm, qwen,
+    minimax, kimi) always return True regardless of version suffix -- see that
+    constant's docstring. This matters on the Anthropic-shaped path (e.g. DeepSeek's
+    ``/anthropic``-compatible endpoint via cc-switch): those requests carry
+    ``thinking`` blocks and go through this gate, and the version-number heuristic
+    below was unreliable for them (fused family+version tokens, 2-digit date-like
+    suffixes) — see ``compression-rate-analysis.md``.
+
+    For any other (unrecognized) third-party name, the same version-number
+    heuristic Anthropic uses is applied as a fallback, e.g. ``gpt-5.5``. Dots are
+    normalized to hyphens before splitting so a dotted minor version (``5.3`` ->
+    ``5``, ``3``) parses the same as Anthropic's ``4-6``; a version token is capped
+    at 2 digits so a date-like suffix (``0731``, ``20250929``) can't be misread as
+    a huge major version. This fallback is best-effort and can still misfire on
+    unfamiliar naming conventions -- add the family to
+    ``_PLAIN_TEXT_REASONING_FAMILIES`` (or a "never bills" list, if one is ever
+    needed) once its actual billing behavior is known, rather than relying on it.
     """
+    model_lower = model.lower()
+    if any(family in model_lower for family in _PLAIN_TEXT_REASONING_FAMILIES):
+        return True
     nums: list[int] = []
-    for part in model.lower().replace(".", "-").split("-"):
+    for part in model_lower.replace(".", "-").split("-"):
         if part.isdigit() and len(part) <= 2:
             nums.append(int(part))
         elif nums:
@@ -108,6 +133,7 @@ def compact_thinking_to_text(
     kompress: Any,
     keep_last_turns: int = 1,
     min_words: int = 40,
+    frozen_message_count: int = 0,
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
     """Replace ``thinking`` blocks with Kompressed ``text`` blocks.
 
@@ -126,6 +152,14 @@ def compact_thinking_to_text(
             left intact (the active reasoning). 0 compacts everything.
         min_words: thinking blocks below this word count are left as-is (not worth
             a Kompress call).
+        frozen_message_count: messages at this index or earlier are currently
+            served from the provider's prompt cache (per the real cache_read_tokens
+            feedback in ``PrefixCacheTracker.get_frozen_message_count()``, not a
+            TTL guess) and are left untouched regardless of ``keep_last_turns`` --
+            compacting one now would flip its bytes and bust an otherwise-still-warm
+            cache. Once a message ages past this boundary the tracker has already
+            told us that region is no longer being served from cache, so compacting
+            it there costs nothing extra. 0 (default) preserves the old behavior.
 
     Returns:
         (new_messages, stats) where stats has ``turns_compacted``, ``blocks``,
@@ -144,6 +178,7 @@ def compact_thinking_to_text(
         if (
             m.get("role") != "assistant"
             or i in keep
+            or i < frozen_message_count
             or not isinstance(content, list)
             or not any(isinstance(b, dict) and b.get("type") == "thinking" for b in content)
         ):
@@ -365,12 +400,17 @@ def _demo() -> None:
     assert not bills_prior_thinking("claude-haiku-4-5-20251001")
     assert not bills_prior_thinking("claude-3-5-sonnet-20241022")
 
-    # third-party naming conventions (dotted minor, fused family+version, date
-    # suffixes that must not be misread as a version number)
+    # plain-text-reasoning families always bill, regardless of version suffix
+    # (fused family+version, date-like suffix, whatever -- name match wins)
     assert bills_prior_thinking("glm-5.3")
     assert bills_prior_thinking("qwen3.7-max")
+    assert bills_prior_thinking("deepseek-v4-flash-0731")
+    assert bills_prior_thinking("deepseek-v4.1-flash")
+    assert bills_prior_thinking("minimax-m2")
+    assert bills_prior_thinking("kimi-k2.7")
+
+    # unrecognized third parties fall back to the version-number heuristic
     assert bills_prior_thinking("gpt-5.5")
-    assert not bills_prior_thinking("deepseek-v4-flash-0731")
 
     # cache_control on a thinking block is carried to the emitted text block
     msgs_cc: list[dict[str, Any]] = [

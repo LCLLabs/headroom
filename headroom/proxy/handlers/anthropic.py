@@ -3763,6 +3763,15 @@ class AnthropicHandlerMixin:
                                     kompress=_tc_kompress,
                                     keep_last_turns=_tc_keep,
                                     min_words=40,
+                                    # Never flip a message inside the region the
+                                    # tracker's real cache_read_tokens feedback
+                                    # says is currently served from cache -- that
+                                    # would manufacture a cache miss this turn was
+                                    # not otherwise going to take. Messages past
+                                    # this boundary are (per that same feedback)
+                                    # already not being served from cache, so
+                                    # compacting them there costs nothing extra.
+                                    frozen_message_count=frozen_message_count,
                                 )
                                 if _tc_stats["turns_compacted"]:
                                     body["messages"] = _tc_messages
